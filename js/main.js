@@ -9,6 +9,7 @@ import { denseDepth, depthToCloud, Accumulator, VERSION as DENSE_VERSION } from 
 import { Sensors } from './sensors.js';
 import { Viewer } from './viewer.js';
 import { exportJSON } from './export.js';
+import { Assist, VERSION as ASSIST_VERSION } from './assist.js';
 
 const $ = id => document.getElementById(id);
 
@@ -18,6 +19,7 @@ const viewer = new Viewer($('view'));
 const tracker = new Tracker();
 const ov = $('ov'), octx = ov.getContext('2d');
 const vidBox = ov.parentElement;
+const assist = new Assist({ vidBox, controls: $('controls') });
 
 const FACTOR = 2;          // la profundidad se calcula a la mitad de la resolución de trabajo
 const GOAL = 0.85;         // cobertura con la que la captura termina sola…
@@ -50,7 +52,7 @@ const stat = m => { if (m !== lastMsg) { $('status').textContent = m; lastMsg = 
 
 /* ---------- Versión y textos de la página ---------- */
 // index.html es fijo: la versión, los textos y los controles nuevos los pone este archivo.
-const APP_VERSION = '8';
+const APP_VERSION = '9';
 const showErr = m => (window.showAppError ? window.showAppError(m) : stat(m));
 $('title').textContent = 'Cámara de registro · v' + APP_VERSION;
 $('help').textContent = 'La imagen 3D se arma con la profundidad de cada píxel. Un dedo gira, el pellizco (o la rueda del mouse) acerca y aleja. ' +
@@ -62,6 +64,7 @@ stat('Pulsa «Iniciar cámara» y muévete lentamente alrededor del objeto. Todo
   if (TRACKER_VERSION !== '5') bad.push('js/tracker.js');
   if (GEOMETRY_VERSION !== '5') bad.push('js/geometry.js');
   if (DENSE_VERSION !== '7') bad.push('js/dense.js');
+  if (ASSIST_VERSION !== '1') bad.push('js/assist.js');
   if (bad.length) showErr('Archivos de otra versión: ' + bad.join(', ') + '. Súbelos de nuevo.');
 }
 
@@ -209,6 +212,7 @@ function finish(auto) {
   $('bNew').disabled = false;
   $('bRoi').disabled = true;
   setMarking(false);
+  assist.done(acc);
   // Muestra la imagen de partida en lugar del video detenido
   octx.clearRect(0, 0, ov.width, ov.height);
   if (k0Image) octx.putImageData(k0Image, 0, 0);
@@ -310,6 +314,7 @@ function startCapture(img) {
   t0 = [0, 0, 0];
   lastGood = { img, R: R0.slice(), t: t0.slice() };
   lost = false;
+  assist.reset();
   rejects = 0;
   poseFails = 0;
   cloud = []; poses = [];
@@ -324,7 +329,12 @@ function step() {
   cam.grab();
   if (marking) { drawOverlay(); return; }
   const img = cam.ctx.getImageData(0, 0, cam.width, cam.height);
+  stepCapture(img);
+  // Asistente de la toma: mapa de cobertura, indicaciones y barra de detección
+  if (!finished) assist.update({ img, tracker, acc, lost, capturing: !needRef && !!acc, roi });
+}
 
+function stepCapture(img) {
   if (needRef) {
     if (startCapture(img)) needRef = false;
     drawOverlay();
