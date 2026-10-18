@@ -1,6 +1,8 @@
 // tracker.js — Seguimiento de puntos característicos con OpenCV.js (flujo óptico Lucas-Kanade).
 // Mantiene la correspondencia entre los puntos del fotograma de referencia y los del fotograma actual.
 
+export const VERSION = '4';
+
 const OPENCV_URL = 'https://docs.opencv.org/4.x/opencv.js';
 let cvPromise = null;
 
