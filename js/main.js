@@ -1,8 +1,8 @@
 // main.js — Conecta los módulos: cámara → seguimiento → geometría → visor / exportación.
 
 import { Camera } from './camera.js';
-import { loadOpenCV, Tracker } from './tracker.js';
-import { reconstructTwoView, normalizeCloud, largestCluster } from './geometry.js';
+import { loadOpenCV, Tracker, VERSION as TRACKER_VERSION } from './tracker.js';
+import { reconstructTwoView, normalizeCloud, largestCluster, VERSION as GEOMETRY_VERSION } from './geometry.js';
 import { Sensors } from './sensors.js';
 import { Viewer } from './viewer.js';
 import { exportJSON } from './export.js';
@@ -30,10 +30,26 @@ let cleanBg = true;
 
 const stat = m => { if (m !== lastMsg) { $('status').textContent = m; lastMsg = m; } };
 
-/* ---------- OpenCV ---------- */
-loadOpenCV()
-  .then(cv => { tracker = new Tracker(cv); })
-  .catch(e => { cvError = e.message; stat('Error: ' + e.message + '. Revisa la conexión y recarga la página.'); });
+/* ---------- Versión ---------- */
+const VERSION = '4';
+const showErr = m => (window.showAppError ? window.showAppError(m) : stat(m));
+{
+  const bad = [];
+  if (window.APP_VERSION !== VERSION) bad.push('index.html');
+  if (TRACKER_VERSION !== VERSION) bad.push('js/tracker.js');
+  if (GEOMETRY_VERSION !== VERSION) bad.push('js/geometry.js');
+  if (bad.length) showErr('Archivos de otra versión: ' + bad.join(', ') + '. Súbelos de nuevo.');
+}
+
+/* ---------- OpenCV (se carga después de abrir la cámara) ---------- */
+let cvStarted = false;
+function startOpenCV() {
+  if (cvStarted) return;
+  cvStarted = true;
+  loadOpenCV()
+    .then(cv => { tracker = new Tracker(cv); })
+    .catch(e => { cvError = e.message; showErr('OpenCV: ' + e.message + '. Revisa la conexión y recarga la página.'); });
+}
 
 /* ---------- Cámara ---------- */
 $('bStart').onclick = async () => {
@@ -49,9 +65,13 @@ $('bStart').onclick = async () => {
     $('bRoi').disabled = false;
     stat('Cámara lista' + (cam.zoomLocked ? ' (zoom bloqueado)' : '') + '. Pulsa «Marcar objeto» y dibuja un recuadro sobre él, luego «Fijar referencia».');
     loop();
+    startOpenCV();
   } catch (err) {
     $('bStart').disabled = false;
-    stat('No pude abrir la cámara: ' + err.message + ' (se necesita HTTPS y permiso de cámara).');
+    const msg = 'No pude abrir la cámara: ' + err.name + ' — ' + err.message +
+      (err.name === 'NotAllowedError' ? '. Activa el permiso de cámara: toca el ícono junto a la dirección web → Permisos → Cámara.' : '.');
+    stat(msg);
+    showErr(msg);
   }
 };
 $('bRef').onclick = () => { if (marking) setMarking(false); wantRef = true; };
@@ -129,9 +149,8 @@ function loop() {
 
 function step() {
   if (!tracker) {
-    stat(cvError
-      ? 'Error: ' + cvError + '. Revisa la conexión y recarga la página.'
-      : 'Cámara lista. Cargando OpenCV.js (puede tardar unos segundos)…');
+    if (cvError) stat('Error: ' + cvError + '. Revisa la conexión y recarga la página.');
+    else if (wantRef) stat('Cargando OpenCV.js (puede tardar unos segundos)… la referencia se fijará al terminar.');
     drawOverlay();
     return;
   }
@@ -241,3 +260,6 @@ $('bExp').onclick = () => exportJSON({
   fov: parseFloat($('fov').value),
   size: { w: cam.width, h: cam.height }
 });
+
+// Señal para el panel de errores: el programa arrancó.
+window.APP_READY = true;
