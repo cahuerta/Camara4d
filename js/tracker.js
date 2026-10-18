@@ -4,20 +4,38 @@
 const OPENCV_URL = 'https://docs.opencv.org/4.x/opencv.js';
 let cvPromise = null;
 
-export function loadOpenCV() {
+export function loadOpenCV(timeoutMs = 90000) {
   if (cvPromise) return cvPromise;
   cvPromise = new Promise((resolve, reject) => {
+    let done = false;
+    const finish = m => {
+      if (done) return;
+      done = true;
+      // El Module de OpenCV.js es "thenable" (tiene .then). Resolver una Promise con él
+      // provoca un bucle infinito que congela la página. Se le quita el .then antes.
+      if (m && typeof m.then === 'function') {
+        try { delete m.then; } catch (e) { /* nada */ }
+        if (typeof m.then === 'function') m.then = undefined;
+      }
+      window.cv = m;
+      resolve(m);
+    };
+    const fail = err => { if (!done) { done = true; reject(err); } };
+    const t0 = Date.now();
     const check = () => {
+      if (done) return;
       const c = window.cv;
+      if (Date.now() - t0 > timeoutMs) { fail(new Error('OpenCV.js no terminó de cargar')); return; }
       if (!c) { setTimeout(check, 150); return; }
-      if (c instanceof Promise) { c.then(m => { window.cv = m; resolve(m); }, reject); return; }
-      if (c.Mat) { resolve(c); return; }
-      c.onRuntimeInitialized = () => resolve(window.cv);
+      if (c instanceof Promise) { c.then(finish, fail); return; }
+      if (c.Mat) { finish(c); return; }
+      c.onRuntimeInitialized = () => finish(c);
+      setTimeout(check, 150);
     };
     const s = document.createElement('script');
     s.async = true;
     s.src = OPENCV_URL;
-    s.onerror = () => reject(new Error('No se pudo cargar OpenCV.js'));
+    s.onerror = () => fail(new Error('No se pudo cargar OpenCV.js'));
     document.head.appendChild(s);
     check();
   });
