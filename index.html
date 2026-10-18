@@ -7,7 +7,8 @@
 <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
-<h1>Cámara de registro · v3</h1>
+<h1>Cámara de registro · v4</h1>
+<div id="err" hidden></div>
 
 <div class="box">
   <div class="vid">
@@ -48,6 +49,30 @@
   <small>Un dedo gira la nube, el pellizco (o la rueda del mouse) acerca y aleja. w = intensidad de cada punto (oscuro −1, claro +1). Con peso 0 ves la nube 3D normal.</small>
 </div>
 
+<script>
+// Panel de errores: muestra en pantalla cualquier error de JavaScript, incluso si los módulos no cargan.
+window.APP_VERSION = '4';
+(function () {
+  function show(msg) {
+    var el = document.getElementById('err');
+    if (!el) return;
+    el.hidden = false;
+    el.textContent += (el.textContent ? '\n' : '') + msg;
+  }
+  window.showAppError = show;
+  window.addEventListener('error', function (e) {
+    var t = e.target;
+    if (t && t !== window && (t.src || t.href)) { show('No se pudo cargar: ' + (t.src || t.href)); return; }
+    show('Error: ' + (e.message || 'desconocido') + (e.filename ? ' (' + e.filename.split('/').pop() + ':' + e.lineno + ')' : ''));
+  }, true);
+  window.addEventListener('unhandledrejection', function (e) {
+    show('Error: ' + ((e.reason && e.reason.message) || e.reason));
+  });
+  setTimeout(function () {
+    if (!window.APP_READY) show('El programa no arrancó: algún archivo de js/ falta o es de otra versión.');
+  }, 6000);
+})();
+</script>
 <script type="module" src="js/main.js"></script>
 </body>
 </html>
