@@ -4,7 +4,7 @@
 import { Camera } from './camera.js';
 import { Tracker, VERSION as TRACKER_VERSION } from './tracker.js';
 import { reconstructTwoView, VERSION as GEOMETRY_VERSION } from './geometry.js';
-import { denseDepth, depthToCloud, VERSION as DENSE_VERSION } from './dense.js';
+import { denseDepth, depthToCloud, Accumulator, VERSION as DENSE_VERSION } from './dense.js';
 import { Sensors } from './sensors.js';
 import { Viewer } from './viewer.js';
 import { exportJSON } from './export.js';
@@ -20,8 +20,14 @@ const vidBox = ov.parentElement;
 
 let running = false, needRef = true, busy = false;
 let cloud = [], poses = [], frame = 0, lastDense = 0;
-let shownCount = 0, shownAt = 0;   // calidad de la imagen 3D en pantalla (para no reemplazarla por una peor)
 let lastMsg = '';
+
+// Captura: todo se acumula en la vista de la primera referencia (K0)
+const GOAL = 0.85;       // cobertura con la que la captura termina sola
+let acc = null;          // acumulador de profundidad
+let k0Image = null;      // imagen de K0 (se muestra al terminar)
+let R0 = [1, 0, 0, 0, 1, 0, 0, 0, 1], t0 = [0, 0, 0];   // pose de la referencia actual respecto de K0
+let lost = false, finished = false;
 
 // Recuadro del objeto (en píxeles del canvas de trabajo) y limpieza de fondo
 let roi = null;          // {x, y, w, h} confirmado
@@ -33,39 +39,84 @@ let cleanBg = true;
 const stat = m => { if (m !== lastMsg) { $('status').textContent = m; lastMsg = m; } };
 
 /* ---------- Versión ---------- */
-const VERSION = '5';
+const VERSION = '6';
 const showErr = m => (window.showAppError ? window.showAppError(m) : stat(m));
 {
+  // Versión que debe tener cada archivo
   const bad = [];
-  if (window.APP_VERSION !== VERSION) bad.push('index.html');
-  if (TRACKER_VERSION !== VERSION) bad.push('js/tracker.js');
-  if (GEOMETRY_VERSION !== VERSION) bad.push('js/geometry.js');
-  if (DENSE_VERSION !== VERSION) bad.push('js/dense.js');
+  if (window.APP_VERSION !== '6') bad.push('index.html');
+  if (TRACKER_VERSION !== '5') bad.push('js/tracker.js');
+  if (GEOMETRY_VERSION !== '5') bad.push('js/geometry.js');
+  if (DENSE_VERSION !== '6') bad.push('js/dense.js');
   if (bad.length) showErr('Archivos de otra versión: ' + bad.join(', ') + '. Súbelos de nuevo.');
 }
 
 /* ---------- Cámara: al iniciar, todo arranca solo ---------- */
-$('bStart').onclick = async () => {
-  $('bStart').disabled = true;
-  await sensors.enable();
+async function startCamera() {
   try {
     await cam.start();
     ov.width = cam.width;
     ov.height = cam.height;
     running = true;
+    finished = false;
     needRef = true;
+    cloud = []; poses = [];
+    viewer.setCloud(cloud);
+    setProgress(0);
     $('bExp').disabled = false;
     $('bRoi').disabled = false;
+    $('bEnd').disabled = false;
+    $('bNew').disabled = true;
     stat('Cámara lista. Apunta al objeto y muévete lentamente a su alrededor.');
     loop();
+    return true;
   } catch (err) {
-    $('bStart').disabled = false;
     const msg = 'No pude abrir la cámara: ' + err.name + ' — ' + err.message +
       (err.name === 'NotAllowedError' ? '. Activa el permiso de cámara: toca el ícono junto a la dirección web → Permisos → Cámara.' : '.');
     stat(msg);
     showErr(msg);
+    return false;
   }
+}
+
+$('bStart').onclick = async () => {
+  $('bStart').disabled = true;
+  await sensors.enable();
+  if (!(await startCamera())) $('bStart').disabled = false;
 };
+$('bEnd').onclick = () => finish(false);
+$('bNew').onclick = async () => {
+  $('bNew').disabled = true;
+  if (!(await startCamera())) $('bNew').disabled = false;
+};
+
+function setProgress(c) {
+  const pct = Math.round(100 * c);
+  $('progBar').style.width = Math.min(100, Math.round(100 * c / GOAL)) + '%';
+  $('progTxt').textContent = 'Cobertura ' + pct + ' % (meta ' + Math.round(100 * GOAL) + ' %)';
+}
+
+// Fin de la captura (automático al llegar a la meta, o con «Terminar»)
+function finish(auto) {
+  if (finished) return;
+  finished = true;
+  running = false;
+  cam.stop();
+  $('bEnd').disabled = true;
+  $('bNew').disabled = false;
+  $('bRoi').disabled = true;
+  setMarking(false);
+  // Muestra la imagen de partida en lugar del video detenido
+  octx.clearRect(0, 0, ov.width, ov.height);
+  if (k0Image) octx.putImageData(k0Image, 0, 0);
+  if (!acc || !acc.fusions) { stat('Captura terminada sin datos suficientes. Pulsa «Nueva captura».'); return; }
+  const dm = acc.depthMap(true, cleanBg);
+  const out = depthToCloud(dm);
+  if (out) { cloud = out; viewer.setCloud(cloud); }
+  stat((auto ? 'Listo: se alcanzó la meta. ' : 'Captura terminada. ') + 'Modelo final con ' + dm.count +
+    ' píxeles (cobertura ' + Math.round(100 * acc.coverage()) + ' %). Gíralo en el visor.');
+}
+
 
 /* ---------- Recuadro del objeto ---------- */
 function setMarking(on) {
@@ -107,8 +158,7 @@ ov.addEventListener('pointerup', e => {
     roi = r;
     $('bRoiClr').disabled = false;
     setMarking(false);
-    needRef = true;   // vuelve a empezar enfocado en el objeto
-    shownCount = 0;
+    needRef = true;   // captura nueva enfocada en el objeto
     stat('Objeto marcado. Muévete lentamente a su alrededor.');
   } else {
     dragStart = null;
@@ -124,15 +174,13 @@ $('bRoiClr').onclick = () => {
   $('bRoiClr').disabled = true;
   setMarking(false);
   needRef = true;
-  shownCount = 0;
   stat('Recuadro borrado: se usa toda la imagen.');
 };
 $('bClean').onclick = () => {
   cleanBg = !cleanBg;
   $('bClean').classList.toggle('on', cleanBg);
   $('bClean').textContent = 'Limpiar fondo: ' + (cleanBg ? 'sí' : 'no');
-  lastDense = 0;   // recalcula con el próximo fotograma
-  shownCount = 0;
+  needRef = true;   // captura nueva con el nuevo criterio
 };
 
 /* ---------- Bucle ---------- */
@@ -143,39 +191,54 @@ function loop() {
   setTimeout(loop, Math.max(15, 70 - (performance.now() - t0)));
 }
 
+// Empieza una captura nueva: esta imagen pasa a ser K0
+function startCapture(img) {
+  const n = tracker.setReference(img, roi);
+  frame = 0;
+  if (n < 30) {
+    stat('Pocos detalles en la imagen (' + n + ' puntos). Apunta a un objeto con más textura o más luz.');
+    return false;
+  }
+  acc = new Accumulator(img, 3, { roi });
+  k0Image = img;
+  R0 = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+  t0 = [0, 0, 0];
+  lost = false;
+  cloud = []; poses = [];
+  viewer.setCloud(cloud);
+  setProgress(0);
+  stat('Capturando: muévete lentamente de lado alrededor del objeto.');
+  return true;
+}
+
 function step() {
+  if (finished) return;
   cam.grab();
   if (marking) { drawOverlay(); return; }
   const img = cam.ctx.getImageData(0, 0, cam.width, cam.height);
 
-  // Referencia automática: al empezar, al marcar el objeto o cuando se pierden los puntos
-  if (needRef || !tracker.tracking) {
-    needRef = false;
-    const n = tracker.setReference(img, roi);
-    frame = 0;
-    if (n < 30) {
-      needRef = true;
-      stat('Pocos detalles en la imagen (' + n + ' puntos). Apunta a un objeto con más textura o más luz.');
-    } else if (!cloud.length) {
-      stat('Siguiendo ' + n + ' puntos. Muévete lentamente de lado alrededor del objeto.');
-    }
+  if (needRef) {
+    if (startCapture(img)) needRef = false;
     drawOverlay();
     return;
   }
+  if (lost) { drawOverlay(); return; }
 
   const s = tracker.track(img);
   frame++;
-  if (s.nAlive < Math.max(30, 0.35 * tracker.N0)) {
-    needRef = true;   // se perdieron demasiados puntos: nueva referencia (la imagen 3D se mantiene)
+  if (s.nAlive < 30) {
+    lost = true;
+    stat('Se perdió el seguimiento (movimiento muy rápido o poca textura). Pulsa «Terminar» para quedarte con lo capturado, o «Marcar objeto» para empezar de nuevo.');
   } else if (s.parallax < 12) {
-    if (!cloud.length) stat('Muévete de lado para ver el objeto desde otro ángulo (' + s.parallax.toFixed(0) + ' px).');
+    if (!acc.fusions) stat('Muévete de lado para ver el objeto desde otro ángulo (' + s.parallax.toFixed(0) + ' px).');
   } else if (frame % 2 === 0 && performance.now() - lastDense > 1000) {
     reconstruct(img);
+    if (finished) return;   // terminó en esta medición: se deja la imagen de partida en pantalla
   }
   drawOverlay();
 }
 
-/* ---------- Reconstrucción: pose (puntos) → profundidad de cada píxel ---------- */
+/* ---------- Reconstrucción: pose → profundidad de cada píxel → se suma al modelo ---------- */
 function reconstruct(img) {
   if (busy) return;
   busy = true;
@@ -189,26 +252,47 @@ function reconstruct(img) {
     tracker.inl.fill(0);
     for (const p of res.pts) tracker.inl[p.id] = 1;
 
-    // Rango de profundidades del objeto a partir de los puntos triangulados
+    // Rango de profundidades a partir de los puntos triangulados
     const ds = res.pts.map(p => -p.P[2]).sort((a, b) => a - b);
     const range = [ds[Math.floor(ds.length * 0.05)], ds[Math.floor(ds.length * 0.95)]];
 
-    const t0 = performance.now();
-    const dm = denseDepth(tracker.refImage, img, res.R, res.t, f, cx, cy, range, { roi, clean: cleanBg });
-    const ms = performance.now() - t0;
+    // El recuadro solo vale mientras la referencia sea K0 (la imagen donde se marcó)
+    const atK0 = acc.fusions === 0 || (t0[0] === 0 && t0[1] === 0 && t0[2] === 0);
+    const dm = denseDepth(tracker.refImage, img, res.R, res.t, f, cx, cy, range, { roi: atK0 ? roi : null, clean: cleanBg });
     lastDense = performance.now();
 
-    // Una imagen claramente peor no reemplaza a la actual (salvo que la actual ya tenga más de 5 s)
-    if (cloud.length && dm.count < 0.6 * shownCount && performance.now() - shownAt < 5000) return;
-    const out = depthToCloud(dm);
-    if (!out) { if (!cloud.length) stat('Aún no hay suficiente detalle para la imagen 3D. Muévete un poco más de lado.'); return; }
-    cloud = out;
-    shownCount = dm.count;
-    shownAt = performance.now();
-    viewer.setCloud(cloud);
-    poses.push({ t: Math.round(performance.now()), R: res.R, tvec: res.t, puntos: res.pts.length, pixeles: dm.count, parallax_px: +tracker.parallax.toFixed(1) });
+    acc.setIntrinsics(f, cx, cy);
+    if (!acc.fuse(dm, R0, t0)) {
+      if (!acc.fusions) stat('Aún no hay suficiente detalle. Muévete un poco más de lado.');
+      return;
+    }
+
+    // Mostrar el modelo acumulado y la cobertura
+    const out = depthToCloud(acc.depthMap(false, cleanBg));
+    if (out) { cloud = out; viewer.setCloud(cloud); }
+    const c = acc.coverage();
+    setProgress(c);
+    poses.push({ t: Math.round(performance.now()), R: res.R, tvec: res.t, escala: acc.scale, puntos: res.pts.length, pixeles: dm.count });
     if (poses.length > 3000) poses.shift();
-    stat('Imagen 3D: ' + dm.count + ' píxeles con profundidad (' + Math.round(ms) + ' ms). Sigue girando para mejorarla.');
+    if (c >= GOAL && acc.fusions >= 3) { finish(true); return; }
+    stat('Capturando: ' + acc.fusions + ' mediciones sumadas. Sigue moviéndote para completar.');
+
+    // Si quedan pocos puntos, esta vista pasa a ser la nueva referencia (con su pose conocida respecto de K0)
+    if (tracker.nAlive < 0.5 * tracker.N0) {
+      const lam = acc.scale, R = res.R, t = res.t;
+      const Rt0 = [R[0] * t0[0] + R[1] * t0[1] + R[2] * t0[2], R[3] * t0[0] + R[4] * t0[1] + R[5] * t0[2], R[6] * t0[0] + R[7] * t0[1] + R[8] * t0[2]];
+      const R0n = [];
+      for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) R0n.push(R[3 * i] * R0[j] + R[3 * i + 1] * R0[3 + j] + R[3 * i + 2] * R0[6 + j]);
+      const n = tracker.setReference(img, null);
+      if (n >= 30) {
+        R0 = R0n;
+        t0 = [Rt0[0] + lam * t[0], Rt0[1] + lam * t[1], Rt0[2] + lam * t[2]];
+        frame = 0;
+      } else {
+        lost = true;
+        stat('Se perdió el seguimiento. Pulsa «Terminar» para quedarte con lo capturado.');
+      }
+    }
   } finally {
     busy = false;
   }
@@ -237,8 +321,7 @@ function drawOverlay() {
 /* ---------- Controles ---------- */
 $('fov').oninput = () => {
   $('fovV').textContent = $('fov').value;
-  lastDense = 0;
-  shownCount = 0;
+  if (running) needRef = true;   // la focal cambia toda la geometría: captura nueva
 };
 $('ws').oninput = () => {
   const v = parseFloat($('ws').value);
@@ -269,3 +352,4 @@ $('bExp').onclick = () => exportJSON({
 
 // Señal para el panel de errores: el programa arrancó.
 window.APP_READY = true;
+  
