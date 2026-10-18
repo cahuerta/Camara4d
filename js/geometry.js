@@ -166,6 +166,41 @@ export function reconstructTwoView(ref, cur, ids, f, cx, cy, maxErr = 3) {
   return { R: pose.R, t: pose.t, pts };
 }
 
+// Limpieza de fondo por profundidad: agrupa los puntos por cercanía en 3D y devuelve el grupo más grande.
+// Dos puntos quedan unidos si están a menos de k veces la distancia típica al vecino más cercano.
+export function largestCluster(pts, k = 3) {
+  const n = pts.length;
+  if (n < 15) return pts;
+  const d2 = (a, b) => (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2;
+  const nn = new Array(n).fill(Infinity);
+  for (let i = 0; i < n; i++) for (let j = i + 1; j < n; j++) {
+    const d = d2(pts[i].P, pts[j].P);
+    if (d < nn[i]) nn[i] = d;
+    if (d < nn[j]) nn[j] = d;
+  }
+  const r = k * Math.sqrt(median(nn));
+  if (!(r > 0)) return pts;
+  const r2 = r * r;
+  const label = new Int32Array(n).fill(-1);
+  let best = -1, bestSize = 0, cur = 0;
+  for (let s = 0; s < n; s++) {
+    if (label[s] >= 0) continue;
+    const stack = [s];
+    label[s] = cur;
+    let size = 0;
+    while (stack.length) {
+      const i = stack.pop();
+      size++;
+      for (let j = 0; j < n; j++) {
+        if (label[j] < 0 && d2(pts[i].P, pts[j].P) <= r2) { label[j] = cur; stack.push(j); }
+      }
+    }
+    if (size > bestSize) { bestSize = size; best = cur; }
+    cur++;
+  }
+  return pts.filter((_, i) => label[i] === best);
+}
+
 // Centra la nube en la mediana, la escala para que la distancia mediana al centro sea 1 (escala auto ajustable)
 // y descarta atípicos. Devuelve [[x,y,z,w,r,g,b],...] o null si quedan muy pocos puntos.
 // w = intensidad del punto en [-1,1] (4ª coordenada).
@@ -182,4 +217,5 @@ export function normalizeCloud(pts, colors) {
     out.push([(o.P[0] - mx) / md, (o.P[1] - my) / md, (o.P[2] - mz) / md, (L - 0.5) * 2, r, g, b]);
   });
   return out.length >= 15 ? out : null;
-}
+                        }
+    
