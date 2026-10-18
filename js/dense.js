@@ -1,207 +1,354 @@
-// dense.js — Reconstrucción densa propia: un mapa de profundidad para CADA píxel (plane sweep + ZNCC).
-// Con la pose relativa (R, t) entre la referencia y el fotograma actual, para cada píxel de la
-// referencia se prueban muchas profundidades; se proyecta en la imagen actual y se compara la
-// ventana de alrededor con correlación cruzada normalizada (ZNCC). Gana la profundidad que mejor calza.
+// main.js — Conecta los módulos: cámara → seguimiento → pose → profundidad densa → visor / exportación.
+// Todo el cálculo es propio (sin librerías externas). Al iniciar la cámara, todo arranca solo.
 
-export const VERSION = '5';
+import { Camera } from './camera.js';
+import { Tracker, VERSION as TRACKER_VERSION } from './tracker.js';
+import { reconstructTwoView, VERSION as GEOMETRY_VERSION } from './geometry.js';
+import { denseDepth, depthToCloud, Accumulator, VERSION as DENSE_VERSION } from './dense.js';
+import { Sensors } from './sensors.js';
+import { Viewer } from './viewer.js';
+import { exportJSON } from './export.js';
 
-// Reduce un ImageData por un factor entero (promedio). Devuelve {gray, rgb, w, h}
-function shrink(img, f) {
-  const W = img.width, H = img.height, w = Math.floor(W / f), h = Math.floor(H / f), d = img.data;
-  const rgb = new Uint8ClampedArray(w * h * 3), gray = new Float32Array(w * h), n = f * f;
-  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
-    let r = 0, g = 0, b = 0;
-    for (let v = 0; v < f; v++) for (let u = 0; u < f; u++) {
-      const o = ((y * f + v) * W + x * f + u) * 4;
-      r += d[o]; g += d[o + 1]; b += d[o + 2];
-    }
-    const k = y * w + x;
-    rgb[3 * k] = r / n; rgb[3 * k + 1] = g / n; rgb[3 * k + 2] = b / n;
-    gray[k] = (0.299 * r + 0.587 * g + 0.114 * b) / n;
-  }
-  return { gray, rgb, w, h };
+const $ = id => document.getElementById(id);
+
+const cam = new Camera($('video'), document.createElement('canvas'));
+const sensors = new Sensors();
+const viewer = new Viewer($('view'));
+const tracker = new Tracker();
+const ov = $('ov'), octx = ov.getContext('2d');
+const vidBox = ov.parentElement;
+
+let running = false, needRef = true, busy = false;
+let cloud = [], poses = [], frame = 0, lastDense = 0;
+let lastMsg = '';
+
+// Captura: todo se acumula en la vista de la primera referencia (K0)
+const GOAL = 0.85;       // cobertura con la que la captura termina sola
+let acc = null;          // acumulador de profundidad
+let k0Image = null;      // imagen de K0 (se muestra al terminar)
+let R0 = [1, 0, 0, 0, 1, 0, 0, 0, 1], t0 = [0, 0, 0];   // pose de la referencia actual respecto de K0
+let lost = false, finished = false;
+
+// Recuadro del objeto (en píxeles del canvas de trabajo) y limpieza de fondo
+let roi = null;          // {x, y, w, h} confirmado
+let roiDraft = null;     // recuadro mientras se dibuja
+let marking = false;
+let dragStart = null;
+let cleanBg = true;
+
+const stat = m => { if (m !== lastMsg) { $('status').textContent = m; lastMsg = m; } };
+
+/* ---------- Versión ---------- */
+const VERSION = '6';
+const showErr = m => (window.showAppError ? window.showAppError(m) : stat(m));
+{
+  // Versión que debe tener cada archivo
+  const bad = [];
+  if (window.APP_VERSION !== '6') bad.push('index.html');
+  if (TRACKER_VERSION !== '5') bad.push('js/tracker.js');
+  if (GEOMETRY_VERSION !== '5') bad.push('js/geometry.js');
+  if (DENSE_VERSION !== '6') bad.push('js/dense.js');
+  if (bad.length) showErr('Archivos de otra versión: ' + bad.join(', ') + '. Súbelos de nuevo.');
 }
 
-// Suma en ventana (2r+1)² con filtro de caja separable. tmp: buffer auxiliar del mismo tamaño.
-function boxSum(src, w, h, r, out, tmp) {
-  for (let y = 0; y < h; y++) {
-    let s = 0;
-    const row = y * w;
-    for (let x = -r; x <= r; x++) s += src[row + Math.min(w - 1, Math.max(0, x))];
-    for (let x = 0; x < w; x++) {
-      tmp[row + x] = s;
-      s += src[row + Math.min(w - 1, x + r + 1)] - src[row + Math.max(0, x - r)];
-    }
-  }
-  for (let x = 0; x < w; x++) {
-    let s = 0;
-    for (let y = -r; y <= r; y++) s += tmp[Math.min(h - 1, Math.max(0, y)) * w + x];
-    for (let y = 0; y < h; y++) {
-      out[y * w + x] = s;
-      s += tmp[Math.min(h - 1, y + r + 1) * w + x] - tmp[Math.max(0, y - r) * w + x];
-    }
+/* ---------- Cámara: al iniciar, todo arranca solo ---------- */
+async function startCamera() {
+  try {
+    await cam.start();
+    ov.width = cam.width;
+    ov.height = cam.height;
+    running = true;
+    finished = false;
+    needRef = true;
+    cloud = []; poses = [];
+    viewer.setCloud(cloud);
+    setProgress(0);
+    $('bExp').disabled = false;
+    $('bRoi').disabled = false;
+    $('bEnd').disabled = false;
+    $('bNew').disabled = true;
+    stat('Cámara lista. Apunta al objeto y muévete lentamente a su alrededor.');
+    loop();
+    return true;
+  } catch (err) {
+    const msg = 'No pude abrir la cámara: ' + err.name + ' — ' + err.message +
+      (err.name === 'NotAllowedError' ? '. Activa el permiso de cámara: toca el ícono junto a la dirección web → Permisos → Cámara.' : '.');
+    stat(msg);
+    showErr(msg);
+    return false;
   }
 }
 
-/*
- * refImg, curImg: ImageData a resolución de trabajo. R, t: X_cur = R·X_ref + t (cámara de referencia).
- * f, cx, cy: intrínsecos a resolución de trabajo. depthRange: [dmin, dmax] de los puntos triangulados.
- * opts: {factor (reducción, 3), steps (profundidades a probar, 64), r (radio de ventana, 3),
- *        minZncc (0.55), minStd (desv. mínima de textura, 3), roi {x,y,w,h} en px de trabajo, clean (bool)}
- * Devuelve {w, h, f, cx, cy, depth: Float32Array (0 = sin dato), rgb, valid}
- */
-export function denseDepth(refImg, curImg, R, t, f, cx, cy, depthRange, opts = {}) {
-  const F = opts.factor || 3, steps = opts.steps || 64, r = opts.r || 3;
-  const minZncc = opts.minZncc ?? 0.55, minStd = opts.minStd ?? 3;
-  const A = shrink(refImg, F), B = shrink(curImg, F);
-  const w = A.w, h = A.h, N = w * h, n = (2 * r + 1) * (2 * r + 1);
-  const fl = f / F, cxl = cx / F, cyl = cy / F;
+$('bStart').onclick = async () => {
+  $('bStart').disabled = true;
+  await sensors.enable();
+  if (!(await startCamera())) $('bStart').disabled = false;
+};
+$('bEnd').onclick = () => finish(false);
+$('bNew').onclick = async () => {
+  $('bNew').disabled = true;
+  if (!(await startCamera())) $('bNew').disabled = false;
+};
 
-  // Zona válida (recuadro del objeto)
-  const inRoi = new Uint8Array(N).fill(1);
-  if (opts.roi) {
-    inRoi.fill(0);
-    const x0 = Math.max(0, Math.floor(opts.roi.x / F)), y0 = Math.max(0, Math.floor(opts.roi.y / F));
-    const x1 = Math.min(w, Math.ceil((opts.roi.x + opts.roi.w) / F)), y1 = Math.min(h, Math.ceil((opts.roi.y + opts.roi.h) / F));
-    for (let y = y0; y < y1; y++) inRoi.fill(1, y * w + x0, y * w + x1);
+function setProgress(c) {
+  const pct = Math.round(100 * c);
+  $('progBar').style.width = Math.min(100, Math.round(100 * c / GOAL)) + '%';
+  $('progTxt').textContent = 'Cobertura ' + pct + ' % (meta ' + Math.round(100 * GOAL) + ' %)';
+}
+
+// Fin de la captura (automático al llegar a la meta, o con «Terminar»)
+function finish(auto) {
+  if (finished) return;
+  finished = true;
+  running = false;
+  cam.stop();
+  $('bEnd').disabled = true;
+  $('bNew').disabled = false;
+  $('bRoi').disabled = true;
+  setMarking(false);
+  // Muestra la imagen de partida en lugar del video detenido
+  octx.clearRect(0, 0, ov.width, ov.height);
+  if (k0Image) octx.putImageData(k0Image, 0, 0);
+  if (!acc || !acc.fusions) { stat('Captura terminada sin datos suficientes. Pulsa «Nueva captura».'); return; }
+  const dm = acc.depthMap(true, cleanBg);
+  const out = depthToCloud(dm);
+  if (out) { cloud = out; viewer.setCloud(cloud); }
+  stat((auto ? 'Listo: se alcanzó la meta. ' : 'Captura terminada. ') + 'Modelo final con ' + dm.count +
+    ' píxeles (cobertura ' + Math.round(100 * acc.coverage()) + ' %). Gíralo en el visor.');
+}
+
+
+/* ---------- Recuadro del objeto ---------- */
+function setMarking(on) {
+  marking = on;
+  roiDraft = null;
+  dragStart = null;
+  vidBox.classList.toggle('marking', on);
+  $('bRoi').classList.toggle('on', on);
+  if (on) stat('Arrastra el dedo sobre el video para encerrar el objeto.');
+}
+
+// Coordenadas del dedo → píxeles del canvas de trabajo
+function toCanvas(e) {
+  const r = ov.getBoundingClientRect();
+  return {
+    x: Math.min(ov.width, Math.max(0, (e.clientX - r.left) * ov.width / r.width)),
+    y: Math.min(ov.height, Math.max(0, (e.clientY - r.top) * ov.height / r.height))
+  };
+}
+function rectFrom(a, b) {
+  return { x: Math.min(a.x, b.x), y: Math.min(a.y, b.y), w: Math.abs(a.x - b.x), h: Math.abs(a.y - b.y) };
+}
+
+ov.addEventListener('pointerdown', e => {
+  if (!marking) return;
+  e.preventDefault();
+  ov.setPointerCapture(e.pointerId);
+  dragStart = toCanvas(e);
+  roiDraft = { x: dragStart.x, y: dragStart.y, w: 0, h: 0 };
+});
+ov.addEventListener('pointermove', e => {
+  if (!marking || !dragStart) return;
+  roiDraft = rectFrom(dragStart, toCanvas(e));
+});
+ov.addEventListener('pointerup', e => {
+  if (!marking || !dragStart) return;
+  const r = rectFrom(dragStart, toCanvas(e));
+  if (r.w >= 20 && r.h >= 20) {
+    roi = r;
+    $('bRoiClr').disabled = false;
+    setMarking(false);
+    needRef = true;   // captura nueva enfocada en el objeto
+    stat('Objeto marcado. Muévete lentamente a su alrededor.');
+  } else {
+    dragStart = null;
+    roiDraft = null;
+    stat('Recuadro muy pequeño. Vuelve a arrastrar sobre el objeto.');
   }
+});
+ov.addEventListener('pointercancel', () => { dragStart = null; roiDraft = null; });
 
-  // Estadísticas de la ventana en la referencia
-  const I = A.gray, I2 = new Float32Array(N);
-  for (let i = 0; i < N; i++) I2[i] = I[i] * I[i];
-  const tmp = new Float32Array(N), Si = new Float32Array(N), Sii = new Float32Array(N);
-  boxSum(I, w, h, r, Si, tmp);
-  boxSum(I2, w, h, r, Sii, tmp);
-  const varI = new Float32Array(N);
-  for (let i = 0; i < N; i++) varI[i] = Math.max(0, Sii[i] - Si[i] * Si[i] / n);
+$('bRoi').onclick = () => setMarking(!marking);
+$('bRoiClr').onclick = () => {
+  roi = null;
+  $('bRoiClr').disabled = true;
+  setMarking(false);
+  needRef = true;
+  stat('Recuadro borrado: se usa toda la imagen.');
+};
+$('bClean').onclick = () => {
+  cleanBg = !cleanBg;
+  $('bClean').classList.toggle('on', cleanBg);
+  $('bClean').textContent = 'Limpiar fondo: ' + (cleanBg ? 'sí' : 'no');
+  needRef = true;   // captura nueva con el nuevo criterio
+};
 
-  // Rayos de la cámara de referencia rotados: R·K⁻¹·[u,v,1]
-  const rx = new Float32Array(N), ry = new Float32Array(N), rz = new Float32Array(N);
-  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
-    const a = (x - cxl) / fl, b = (y - cyl) / fl, i = y * w + x;
-    rx[i] = R[0] * a + R[1] * b + R[2];
-    ry[i] = R[3] * a + R[4] * b + R[5];
-    rz[i] = R[6] * a + R[7] * b + R[8];
+/* ---------- Bucle ---------- */
+function loop() {
+  if (!running) return;
+  const t0 = performance.now();
+  try { step(); } catch (e) { showErr('Error: ' + e.message); }
+  setTimeout(loop, Math.max(15, 70 - (performance.now() - t0)));
+}
+
+// Empieza una captura nueva: esta imagen pasa a ser K0
+function startCapture(img) {
+  const n = tracker.setReference(img, roi);
+  frame = 0;
+  if (n < 30) {
+    stat('Pocos detalles en la imagen (' + n + ' puntos). Apunta a un objeto con más textura o más luz.');
+    return false;
   }
+  acc = new Accumulator(img, 3, { roi });
+  k0Image = img;
+  R0 = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+  t0 = [0, 0, 0];
+  lost = false;
+  cloud = []; poses = [];
+  viewer.setCloud(cloud);
+  setProgress(0);
+  stat('Capturando: muévete lentamente de lado alrededor del objeto.');
+  return true;
+}
 
-  // Profundidades a probar, uniformes en profundidad inversa
-  const dmin = Math.max(1e-3, depthRange[0] * 0.6), dmax = depthRange[1] * 1.6;
-  const invA = 1 / dmax, invB = 1 / dmin;
-  const invs = new Float32Array(steps);
-  for (let s = 0; s < steps; s++) invs[s] = invA + (invB - invA) * s / (steps - 1);
+function step() {
+  if (finished) return;
+  cam.grab();
+  if (marking) { drawOverlay(); return; }
+  const img = cam.ctx.getImageData(0, 0, cam.width, cam.height);
 
-  const best = new Float32Array(N).fill(-2), bestS = new Int32Array(N).fill(-1);
-  const seen = new Uint16Array(N);   // en cuántas profundidades el píxel es visible en la otra imagen
-  const scores = new Float32Array(N * steps);
-  const Wd = new Float32Array(N), Vd = new Float32Array(N), WI = new Float32Array(N), W2 = new Float32Array(N);
-  const Sw = new Float32Array(N), Sww = new Float32Array(N), Siw = new Float32Array(N), Sv = new Float32Array(N);
-  const Bg = B.gray;
+  if (needRef) {
+    if (startCapture(img)) needRef = false;
+    drawOverlay();
+    return;
+  }
+  if (lost) { drawOverlay(); return; }
 
-  for (let s = 0; s < steps; s++) {
-    const d = 1 / invs[s];
-    // Imagen actual "deformada" hacia la referencia para esta profundidad
-    for (let i = 0; i < N; i++) {
-      const X = d * rx[i] + t[0], Y = d * ry[i] + t[1], Z = d * rz[i] + t[2];
-      let ok = 0, val = 0;
-      if (Z > 1e-6) {
-        const u = fl * X / Z + cxl, v = fl * Y / Z + cyl;
-        if (u >= 0 && v >= 0 && u < w - 1 && v < h - 1) {
-          const x0 = u | 0, y0 = v | 0, ax = u - x0, ay = v - y0, k = y0 * w + x0;
-          val = (Bg[k] * (1 - ax) + Bg[k + 1] * ax) * (1 - ay) + (Bg[k + w] * (1 - ax) + Bg[k + w + 1] * ax) * ay;
-          ok = 1;
-        }
+  const s = tracker.track(img);
+  frame++;
+  if (s.nAlive < 30) {
+    lost = true;
+    stat('Se perdió el seguimiento (movimiento muy rápido o poca textura). Pulsa «Terminar» para quedarte con lo capturado, o «Marcar objeto» para empezar de nuevo.');
+  } else if (s.parallax < 12) {
+    if (!acc.fusions) stat('Muévete de lado para ver el objeto desde otro ángulo (' + s.parallax.toFixed(0) + ' px).');
+  } else if (frame % 2 === 0 && performance.now() - lastDense > 1000) {
+    reconstruct(img);
+    if (finished) return;   // terminó en esta medición: se deja la imagen de partida en pantalla
+  }
+  drawOverlay();
+}
+
+/* ---------- Reconstrucción: pose → profundidad de cada píxel → se suma al modelo ---------- */
+function reconstruct(img) {
+  if (busy) return;
+  busy = true;
+  try {
+    const fov = parseFloat($('fov').value);
+    const f = cam.focalPx(fov), cx = cam.width / 2, cy = cam.height / 2;
+    const ids = tracker.aliveIds();
+    const res = reconstructTwoView(tracker.ref, tracker.cur, ids, f, cx, cy);
+    if (!res || res.pts.length < 20) { stat('Calculando posición de la cámara… sigue moviéndote lentamente.'); return; }
+
+    tracker.inl.fill(0);
+    for (const p of res.pts) tracker.inl[p.id] = 1;
+
+    // Rango de profundidades a partir de los puntos triangulados
+    const ds = res.pts.map(p => -p.P[2]).sort((a, b) => a - b);
+    const range = [ds[Math.floor(ds.length * 0.05)], ds[Math.floor(ds.length * 0.95)]];
+
+    // El recuadro solo vale mientras la referencia sea K0 (la imagen donde se marcó)
+    const atK0 = acc.fusions === 0 || (t0[0] === 0 && t0[1] === 0 && t0[2] === 0);
+    const dm = denseDepth(tracker.refImage, img, res.R, res.t, f, cx, cy, range, { roi: atK0 ? roi : null, clean: cleanBg });
+    lastDense = performance.now();
+
+    acc.setIntrinsics(f, cx, cy);
+    if (!acc.fuse(dm, R0, t0)) {
+      if (!acc.fusions) stat('Aún no hay suficiente detalle. Muévete un poco más de lado.');
+      return;
+    }
+
+    // Mostrar el modelo acumulado y la cobertura
+    const out = depthToCloud(acc.depthMap(false, cleanBg));
+    if (out) { cloud = out; viewer.setCloud(cloud); }
+    const c = acc.coverage();
+    setProgress(c);
+    poses.push({ t: Math.round(performance.now()), R: res.R, tvec: res.t, escala: acc.scale, puntos: res.pts.length, pixeles: dm.count });
+    if (poses.length > 3000) poses.shift();
+    if (c >= GOAL && acc.fusions >= 3) { finish(true); return; }
+    stat('Capturando: ' + acc.fusions + ' mediciones sumadas. Sigue moviéndote para completar.');
+
+    // Si quedan pocos puntos, esta vista pasa a ser la nueva referencia (con su pose conocida respecto de K0)
+    if (tracker.nAlive < 0.5 * tracker.N0) {
+      const lam = acc.scale, R = res.R, t = res.t;
+      const Rt0 = [R[0] * t0[0] + R[1] * t0[1] + R[2] * t0[2], R[3] * t0[0] + R[4] * t0[1] + R[5] * t0[2], R[6] * t0[0] + R[7] * t0[1] + R[8] * t0[2]];
+      const R0n = [];
+      for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) R0n.push(R[3 * i] * R0[j] + R[3 * i + 1] * R0[3 + j] + R[3 * i + 2] * R0[6 + j]);
+      const n = tracker.setReference(img, null);
+      if (n >= 30) {
+        R0 = R0n;
+        t0 = [Rt0[0] + lam * t[0], Rt0[1] + lam * t[1], Rt0[2] + lam * t[2]];
+        frame = 0;
+      } else {
+        lost = true;
+        stat('Se perdió el seguimiento. Pulsa «Terminar» para quedarte con lo capturado.');
       }
-      Wd[i] = val; Vd[i] = ok; WI[i] = val * I[i]; W2[i] = val * val;
     }
-    boxSum(Wd, w, h, r, Sw, tmp);
-    boxSum(W2, w, h, r, Sww, tmp);
-    boxSum(WI, w, h, r, Siw, tmp);
-    boxSum(Vd, w, h, r, Sv, tmp);
-    const base = s * N;
-    for (let i = 0; i < N; i++) {
-      let z = -1;
-      if (Sv[i] >= n - 0.5) {
-        const vw = Sww[i] - Sw[i] * Sw[i] / n;
-        const cov = Siw[i] - Si[i] * Sw[i] / n;
-        const den = Math.sqrt(varI[i] * vw);
-        if (den > 1e-6) z = cov / den;
-      }
-      scores[base + i] = z;
-      if (z > -1) seen[i]++;
-      if (z > best[i]) { best[i] = z; bestS[i] = s; }
-    }
+  } finally {
+    busy = false;
   }
-
-  // Profundidad con ajuste subpíxel (parábola) y filtros de confianza
-  const depth = new Float32Array(N), valid = new Uint8Array(N);
-  const minVar = minStd * minStd * n;
-  for (let i = 0; i < N; i++) {
-    const s = bestS[i];
-    // Se descartan píxeles que la otra vista no ve bien (bordes, zonas tapadas) o sin textura
-    if (!inRoi[i] || s <= 0 || s >= steps - 1 || best[i] < minZncc || varI[i] < minVar || seen[i] < 0.8 * steps) continue;
-    const a = scores[(s - 1) * N + i], b = scores[s * N + i], c = scores[(s + 1) * N + i];
-    const den = a - 2 * b + c;
-    const off = den < 0 ? Math.max(-0.5, Math.min(0.5, 0.5 * (a - c) / den)) : 0;
-    const inv = invs[s] + off * (invs[1] - invs[0]);
-    depth[i] = 1 / inv;
-    valid[i] = 1;
-  }
-
-  // Quita manchas: cada píxel debe parecerse a la mediana de sus vecinos válidos
-  const clean = new Float32Array(N);
-  const nb = [];
-  for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
-    const i = y * w + x;
-    if (!valid[i]) continue;
-    nb.length = 0;
-    for (let v = -1; v <= 1; v++) for (let u = -1; u <= 1; u++) { const j = i + v * w + u; if (valid[j]) nb.push(depth[j]); }
-    if (nb.length < 5) continue;
-    nb.sort((p, q) => p - q);
-    const med = nb[nb.length >> 1];
-    if (Math.abs(depth[i] - med) < 0.04 * med) clean[i] = med;
-  }
-
-  // Limpiar fondo: el objeto es lo que está en el recuadro (o, sin recuadro, en el centro de la imagen).
-  // Se toma la profundidad típica de esa zona y se descarta lo que esté mucho más cerca o más lejos.
-  if (opts.clean) {
-    const ds = [];
-    let zx0 = Math.floor(w * 0.35), zx1 = Math.ceil(w * 0.65), zy0 = Math.floor(h * 0.35), zy1 = Math.ceil(h * 0.65);
-    if (opts.roi) {
-      const rx0 = opts.roi.x / F, ry0 = opts.roi.y / F, rw = opts.roi.w / F, rh = opts.roi.h / F;
-      zx0 = Math.floor(rx0 + rw * 0.3); zx1 = Math.ceil(rx0 + rw * 0.7);
-      zy0 = Math.floor(ry0 + rh * 0.3); zy1 = Math.ceil(ry0 + rh * 0.7);
-    }
-    for (let y = Math.max(0, zy0); y < Math.min(h, zy1); y++)
-      for (let x = Math.max(0, zx0); x < Math.min(w, zx1); x++) { const d = clean[y * w + x]; if (d > 0) ds.push(d); }
-    if (ds.length > 20) {
-      ds.sort((p, q) => p - q);
-      const med = ds[ds.length >> 1];
-      for (let i = 0; i < N; i++) if (clean[i] > 0 && Math.abs(clean[i] - med) > 0.35 * med) clean[i] = 0;
-    }
-  }
-
-  let count = 0;
-  for (let i = 0; i < N; i++) if (clean[i] > 0) count++;
-  return { w, h, f: fl, cx: cxl, cy: cyl, depth: clean, rgb: A.rgb, count };
 }
 
-// Convierte el mapa de profundidad en la nube del visor: [x,y,z,w,r,g,b,tamaño] normalizada
-// (centro en la mediana, distancia mediana = 1). Cada punto lleva el tamaño de su píxel para cubrir la superficie.
-export function depthToCloud(dm) {
-  const pts = [];
-  const { w, h, f, cx, cy, depth, rgb } = dm;
-  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
-    const i = y * w + x, d = depth[i];
-    if (!(d > 0)) continue;
-    pts.push([d * (x - cx) / f, -d * (y - cy) / f, -d, i, d]);
+function drawOverlay() {
+  octx.clearRect(0, 0, ov.width, ov.height);
+  const r = roiDraft || roi;
+  if (r) {
+    octx.lineWidth = 2;
+    octx.strokeStyle = '#f7c948';
+    octx.setLineDash(roiDraft ? [6, 4] : []);
+    octx.strokeRect(r.x, r.y, r.w, r.h);
+    octx.setLineDash([]);
   }
-  if (pts.length < 30) return null;
-  const med = arr => { const s = arr.slice().sort((a, b) => a - b); return s[s.length >> 1]; };
-  const mx = med(pts.map(p => p[0])), my = med(pts.map(p => p[1])), mz = med(pts.map(p => p[2]));
-  const md = med(pts.map(p => Math.hypot(p[0] - mx, p[1] - my, p[2] - mz))) || 1;
-  return pts.map(p => {
-    const i = p[3], r = rgb[3 * i], g = rgb[3 * i + 1], b = rgb[3 * i + 2];
-    const L = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
-    return [(p[0] - mx) / md, (p[1] - my) / md, (p[2] - mz) / md, (L - 0.5) * 2, r, g, b, 1.25 * p[4] / f / md];
-  });
+  if (!tracker.tracking || marking) return;
+  for (let i = 0; i < tracker.N; i++) {
+    if (!tracker.alive[i]) continue;
+    octx.fillStyle = tracker.inl[i] ? '#4cc9f0' : '#3ddc84';
+    octx.beginPath();
+    octx.arc(tracker.cur[2 * i], tracker.cur[2 * i + 1], tracker.inl[i] ? 2.4 : 1.6, 0, 6.283);
+    octx.fill();
+  }
 }
+
+/* ---------- Controles ---------- */
+$('fov').oninput = () => {
+  $('fovV').textContent = $('fov').value;
+  if (running) needRef = true;   // la focal cambia toda la geometría: captura nueva
+};
+$('ws').oninput = () => {
+  const v = parseFloat($('ws').value);
+  $('wsV').textContent = v.toFixed(1);
+  viewer.setWScale(v);
+};
+
+const setMode = m => {
+  viewer.setMode(m);
+  $('m3').classList.toggle('on', m === '3d');
+  $('m4').classList.toggle('on', m === '4d');
+};
+$('m3').onclick = () => setMode('3d');
+$('m4').onclick = () => setMode('4d');
+$('bAuto').onclick = () => {
+  viewer.setAuto(!viewer.auto);
+  $('bAuto').classList.toggle('on', viewer.auto);
+};
+$('zIn').onclick = () => viewer.zoomBy(1.25);
+$('zOut').onclick = () => viewer.zoomBy(0.8);
+$('zReset').onclick = () => viewer.resetView();
+
+$('bExp').onclick = () => exportJSON({
+  cloud, poses, imu: sensors.samples,
+  fov: parseFloat($('fov').value),
+  size: { w: cam.width, h: cam.height }
+});
+
+// Señal para el panel de errores: el programa arrancó.
+window.APP_READY = true;
