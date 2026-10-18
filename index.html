@@ -7,7 +7,7 @@
 <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
-<h1>Cámara de registro · v2</h1>
+<h1>Cámara de registro · v3</h1>
 
 <div class="box">
   <div class="vid">
@@ -19,7 +19,12 @@
     <button id="bRef" disabled>Fijar referencia</button>
     <button id="bExp" disabled>Exportar JSON</button>
   </div>
-  <div id="status">Pulsa «Iniciar cámara». Apunta a un objeto quieto con textura, pulsa «Fijar referencia» y mueve el teléfono alrededor del objeto (no solo girarlo sobre su eje).</div>
+  <div class="row">
+    <button id="bRoi" disabled>Marcar objeto</button>
+    <button id="bRoiClr" disabled>Borrar recuadro</button>
+    <button id="bClean" class="on">Limpiar fondo: sí</button>
+  </div>
+  <div id="status">Pulsa «Iniciar cámara». Con «Marcar objeto» dibuja un recuadro sobre el objeto, pulsa «Fijar referencia» y mueve el teléfono alrededor del objeto (no solo girarlo sobre su eje).</div>
   <div class="row">
     <label>Campo de visión (lado largo): <b id="fovV">65</b>°
       <input type="range" id="fov" min="35" max="120" value="65"></label>
