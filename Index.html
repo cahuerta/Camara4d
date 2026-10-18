@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Cámara de registro 4D</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<h1>Cámara de registro · v2</h1>
+
+<div class="box">
+  <div class="vid">
+    <video id="video" playsinline muted></video>
+    <canvas id="ov"></canvas>
+  </div>
+  <div class="row">
+    <button class="pri" id="bStart">Iniciar cámara</button>
+    <button id="bRef" disabled>Fijar referencia</button>
+    <button id="bExp" disabled>Exportar JSON</button>
+  </div>
+  <div id="status">Pulsa «Iniciar cámara». Apunta a un objeto quieto con textura, pulsa «Fijar referencia» y mueve el teléfono alrededor del objeto (no solo girarlo sobre su eje).</div>
+  <div class="row">
+    <label>Campo de visión (lado largo): <b id="fovV">65</b>°
+      <input type="range" id="fov" min="35" max="120" value="65"></label>
+    <label>Peso de la 4ª coordenada w: <b id="wsV">1.0</b>
+      <input type="range" id="ws" min="0" max="2" step="0.05" value="1"></label>
+  </div>
+</div>
+
+<div class="box">
+  <canvas id="view"></canvas>
+  <div class="row">
+    <button id="m3" class="on">Arrastrar: 3D</button>
+    <button id="m4">Arrastrar: 4D</button>
+    <button id="bAuto">Rotación 4D auto</button>
+  </div>
+  <div class="row">
+    <button id="zOut">Alejar −</button>
+    <button id="zIn">Acercar +</button>
+    <button id="zReset">Reiniciar vista</button>
+  </div>
+  <small>Un dedo gira la nube, el pellizco (o la rueda del mouse) acerca y aleja. w = intensidad de cada punto (oscuro −1, claro +1). Con peso 0 ves la nube 3D normal.</small>
+</div>
+
+<script type="module" src="js/main.js"></script>
+</body>
+</html>
