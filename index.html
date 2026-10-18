@@ -7,7 +7,8 @@
 <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
-<h1>Cámara de registro · v6</h1>
+<!-- Esqueleto fijo de la página. Los textos, la versión y los controles nuevos los pone el código (js/). -->
+<h1 id="title">Cámara de registro</h1>
 <div id="err" hidden></div>
 
 <div class="box">
@@ -26,9 +27,11 @@
     <button id="bRoiClr" disabled>Borrar recuadro</button>
     <button id="bClean" class="on">Limpiar fondo: sí</button>
   </div>
+  <!-- Controles que se agreguen en el futuro (los crea el código) -->
+  <div class="row" id="controls"></div>
   <div class="prog"><div id="progBar"></div></div>
-  <div id="progTxt">Cobertura 0 % (meta 85 %)</div>
-  <div id="status">Pulsa «Iniciar cámara» y muévete lentamente alrededor del objeto. Todo se va sumando; la captura termina sola al llegar a la meta, o con «Terminar».</div>
+  <div id="progTxt"></div>
+  <div id="status"></div>
   <div class="row">
     <label>Campo de visión (lado largo): <b id="fovV">65</b>°
       <input type="range" id="fov" min="35" max="120" value="65"></label>
@@ -49,12 +52,11 @@
     <button id="zIn">Acercar +</button>
     <button id="zReset">Reiniciar vista</button>
   </div>
-  <small>La imagen 3D se arma con la profundidad de cada píxel. Un dedo gira, el pellizco (o la rueda del mouse) acerca y aleja. w = intensidad de cada punto (oscuro −1, claro +1); con peso 0 ves la imagen 3D normal.</small>
+  <small id="help"></small>
 </div>
 
 <script>
 // Panel de errores: muestra en pantalla cualquier error de JavaScript, incluso si los módulos no cargan.
-window.APP_VERSION = '6';
 (function () {
   function show(msg) {
     var el = document.getElementById('err');
