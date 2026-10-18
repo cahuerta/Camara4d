@@ -78,11 +78,21 @@ export class Tracker {
   }
 
   // Fija el fotograma actual como referencia y detecta los puntos a seguir.
-  setReference(canvas) {
+  // roi opcional {x, y, w, h} en píxeles del canvas de trabajo: solo se detectan puntos dentro del recuadro.
+  setReference(canvas, roi = null) {
     const cv = this.cv;
     const gray = this._gray(canvas);
     const corners = new cv.Mat();
-    const mask = new cv.Mat();
+    let mask;
+    if (roi) {
+      mask = cv.Mat.zeros(gray.rows, gray.cols, cv.CV_8UC1);
+      const x0 = Math.max(0, Math.floor(roi.x)), y0 = Math.max(0, Math.floor(roi.y));
+      const x1 = Math.min(gray.cols, Math.ceil(roi.x + roi.w)), y1 = Math.min(gray.rows, Math.ceil(roi.y + roi.h));
+      const md = mask.data;
+      for (let y = y0; y < y1; y++) md.fill(255, y * gray.cols + x0, y * gray.cols + x1);
+    } else {
+      mask = new cv.Mat();
+    }
     cv.goodFeaturesToTrack(gray, corners, this.maxPoints, 0.01, this.minDist, mask, 7);
     mask.delete();
 
