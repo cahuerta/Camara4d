@@ -3,8 +3,9 @@
 body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;padding:12px;padding-bottom:40px;max-width:720px;margin-inline:auto}
 h1{font-size:18px;margin:4px 0 10px}
 .box{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px;margin-bottom:10px}
-.vid{position:relative;width:100%;background:#000;border-radius:10px;overflow:hidden;min-height:120px}
-.vid video{width:100%;display:block}
+/* Cámara compacta: el video ocupa como máximo un tercio de la pantalla y se centra */
+.vid{position:relative;width:fit-content;max-width:100%;margin:0 auto;background:#000;border-radius:10px;overflow:hidden;min-height:80px;min-width:120px}
+.vid video{display:block;max-width:100%;max-height:34vh;width:auto;height:auto}
 .vid canvas{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
 .vid.marking canvas{pointer-events:auto;touch-action:none;cursor:crosshair}
 .vid.marking{outline:2px dashed var(--ac);outline-offset:-2px}
@@ -22,3 +23,11 @@ small{color:var(--mut);display:block;margin-top:8px}
 .prog{height:8px;background:#1d2330;border:1px solid var(--line);border-radius:6px;overflow:hidden;margin-top:10px}
 #progBar{height:100%;width:0;background:var(--ac);transition:width .3s}
 #progTxt{font-size:12px;color:var(--mut);margin-top:4px}
+/* Asistente de la toma (assist.js) */
+.vid canvas.as-map{inset:6px 6px auto auto;width:30%;height:auto;border:1px solid rgba(255,255,255,.55);border-radius:6px;pointer-events:none}
+.vid.marking canvas.as-map{pointer-events:none}
+.as-hint{position:absolute;left:6px;right:6px;bottom:6px;background:rgba(5,7,11,.72);color:#fff;font-size:15px;font-weight:600;text-align:center;padding:6px 8px;border-radius:8px;pointer-events:none}
+.as-det{display:flex;align-items:center;gap:8px;width:100%;font-size:12px;color:var(--mut)}
+.as-det-bar{flex:1;height:8px;background:#1d2330;border:1px solid var(--line);border-radius:6px;overflow:hidden}
+.as-det-fill{height:100%;width:0;background:#ff5d5d;transition:width .2s}
+.as-det-val{min-width:36px;text-align:right}
