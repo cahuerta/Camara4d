@@ -7,7 +7,7 @@
 <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
-<h1>Cámara de registro · v5</h1>
+<h1>Cámara de registro · v6</h1>
 <div id="err" hidden></div>
 
 <div class="box">
@@ -17,6 +17,8 @@
   </div>
   <div class="row">
     <button class="pri" id="bStart">Iniciar cámara</button>
+    <button id="bEnd" disabled>Terminar</button>
+    <button id="bNew" disabled>Nueva captura</button>
     <button id="bExp" disabled>Exportar JSON</button>
   </div>
   <div class="row">
@@ -24,7 +26,9 @@
     <button id="bRoiClr" disabled>Borrar recuadro</button>
     <button id="bClean" class="on">Limpiar fondo: sí</button>
   </div>
-  <div id="status">Pulsa «Iniciar cámara» y muévete lentamente alrededor del objeto. Todo arranca solo. Opcional: «Marcar objeto» para encerrarlo con un recuadro.</div>
+  <div class="prog"><div id="progBar"></div></div>
+  <div id="progTxt">Cobertura 0 % (meta 85 %)</div>
+  <div id="status">Pulsa «Iniciar cámara» y muévete lentamente alrededor del objeto. Todo se va sumando; la captura termina sola al llegar a la meta, o con «Terminar».</div>
   <div class="row">
     <label>Campo de visión (lado largo): <b id="fovV">65</b>°
       <input type="range" id="fov" min="35" max="120" value="65"></label>
@@ -50,7 +54,7 @@
 
 <script>
 // Panel de errores: muestra en pantalla cualquier error de JavaScript, incluso si los módulos no cargan.
-window.APP_VERSION = '5';
+window.APP_VERSION = '6';
 (function () {
   function show(msg) {
     var el = document.getElementById('err');
