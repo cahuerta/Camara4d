@@ -1,8 +1,10 @@
-// main.js — Conecta los módulos: cámara → seguimiento → geometría → visor / exportación.
+// main.js — Conecta los módulos: cámara → seguimiento → pose → profundidad densa → visor / exportación.
+// Todo el cálculo es propio (sin librerías externas). Al iniciar la cámara, todo arranca solo.
 
 import { Camera } from './camera.js';
-import { loadOpenCV, Tracker, VERSION as TRACKER_VERSION } from './tracker.js';
-import { reconstructTwoView, normalizeCloud, largestCluster, VERSION as GEOMETRY_VERSION } from './geometry.js';
+import { Tracker, VERSION as TRACKER_VERSION } from './tracker.js';
+import { reconstructTwoView, VERSION as GEOMETRY_VERSION } from './geometry.js';
+import { denseDepth, depthToCloud, VERSION as DENSE_VERSION } from './dense.js';
 import { Sensors } from './sensors.js';
 import { Viewer } from './viewer.js';
 import { exportJSON } from './export.js';
@@ -12,13 +14,13 @@ const $ = id => document.getElementById(id);
 const cam = new Camera($('video'), document.createElement('canvas'));
 const sensors = new Sensors();
 const viewer = new Viewer($('view'));
+const tracker = new Tracker();
 const ov = $('ov'), octx = ov.getContext('2d');
 const vidBox = ov.parentElement;
 
-let tracker = null;
-let cvError = null;   // mensaje si OpenCV.js no pudo cargar
-let running = false, wantRef = false;
-let cloud = [], poses = [], frame = 0, nInl = 0, nObj = 0;
+let running = false, needRef = true, busy = false;
+let cloud = [], poses = [], frame = 0, lastDense = 0;
+let shownCount = 0, shownAt = 0;   // calidad de la imagen 3D en pantalla (para no reemplazarla por una peor)
 let lastMsg = '';
 
 // Recuadro del objeto (en píxeles del canvas de trabajo) y limpieza de fondo
@@ -31,27 +33,18 @@ let cleanBg = true;
 const stat = m => { if (m !== lastMsg) { $('status').textContent = m; lastMsg = m; } };
 
 /* ---------- Versión ---------- */
-const VERSION = '4';
+const VERSION = '5';
 const showErr = m => (window.showAppError ? window.showAppError(m) : stat(m));
 {
   const bad = [];
   if (window.APP_VERSION !== VERSION) bad.push('index.html');
   if (TRACKER_VERSION !== VERSION) bad.push('js/tracker.js');
   if (GEOMETRY_VERSION !== VERSION) bad.push('js/geometry.js');
+  if (DENSE_VERSION !== VERSION) bad.push('js/dense.js');
   if (bad.length) showErr('Archivos de otra versión: ' + bad.join(', ') + '. Súbelos de nuevo.');
 }
 
-/* ---------- OpenCV (se carga después de abrir la cámara) ---------- */
-let cvStarted = false;
-function startOpenCV() {
-  if (cvStarted) return;
-  cvStarted = true;
-  loadOpenCV()
-    .then(cv => { tracker = new Tracker(cv); })
-    .catch(e => { cvError = e.message; showErr('OpenCV: ' + e.message + '. Revisa la conexión y recarga la página.'); });
-}
-
-/* ---------- Cámara ---------- */
+/* ---------- Cámara: al iniciar, todo arranca solo ---------- */
 $('bStart').onclick = async () => {
   $('bStart').disabled = true;
   await sensors.enable();
@@ -60,12 +53,11 @@ $('bStart').onclick = async () => {
     ov.width = cam.width;
     ov.height = cam.height;
     running = true;
-    $('bRef').disabled = false;
+    needRef = true;
     $('bExp').disabled = false;
     $('bRoi').disabled = false;
-    stat('Cámara lista' + (cam.zoomLocked ? ' (zoom bloqueado)' : '') + '. Pulsa «Marcar objeto» y dibuja un recuadro sobre él, luego «Fijar referencia».');
+    stat('Cámara lista. Apunta al objeto y muévete lentamente a su alrededor.');
     loop();
-    startOpenCV();
   } catch (err) {
     $('bStart').disabled = false;
     const msg = 'No pude abrir la cámara: ' + err.name + ' — ' + err.message +
@@ -74,7 +66,6 @@ $('bStart').onclick = async () => {
     showErr(msg);
   }
 };
-$('bRef').onclick = () => { if (marking) setMarking(false); wantRef = true; };
 
 /* ---------- Recuadro del objeto ---------- */
 function setMarking(on) {
@@ -109,21 +100,22 @@ ov.addEventListener('pointermove', e => {
   if (!marking || !dragStart) return;
   roiDraft = rectFrom(dragStart, toCanvas(e));
 });
-const endDrag = e => {
+ov.addEventListener('pointerup', e => {
   if (!marking || !dragStart) return;
   const r = rectFrom(dragStart, toCanvas(e));
   if (r.w >= 20 && r.h >= 20) {
     roi = r;
     $('bRoiClr').disabled = false;
     setMarking(false);
-    stat('Objeto marcado. Pulsa «Fijar referencia» y mueve el teléfono alrededor.');
+    needRef = true;   // vuelve a empezar enfocado en el objeto
+    shownCount = 0;
+    stat('Objeto marcado. Muévete lentamente a su alrededor.');
   } else {
     dragStart = null;
     roiDraft = null;
     stat('Recuadro muy pequeño. Vuelve a arrastrar sobre el objeto.');
   }
-};
-ov.addEventListener('pointerup', endDrag);
+});
 ov.addEventListener('pointercancel', () => { dragStart = null; roiDraft = null; });
 
 $('bRoi').onclick = () => setMarking(!marking);
@@ -131,85 +123,99 @@ $('bRoiClr').onclick = () => {
   roi = null;
   $('bRoiClr').disabled = true;
   setMarking(false);
-  stat('Recuadro borrado: se usará toda la imagen.');
+  needRef = true;
+  shownCount = 0;
+  stat('Recuadro borrado: se usa toda la imagen.');
 };
 $('bClean').onclick = () => {
   cleanBg = !cleanBg;
   $('bClean').classList.toggle('on', cleanBg);
   $('bClean').textContent = 'Limpiar fondo: ' + (cleanBg ? 'sí' : 'no');
-  if (tracker && tracker.tracking && tracker.nAlive >= 30 && tracker.parallax >= 10) reconstruct();
+  lastDense = 0;   // recalcula con el próximo fotograma
+  shownCount = 0;
 };
 
 /* ---------- Bucle ---------- */
 function loop() {
   if (!running) return;
-  try { step(); } catch (e) { stat('Error: ' + e.message); }
-  setTimeout(loop, 90);
+  const t0 = performance.now();
+  try { step(); } catch (e) { showErr('Error: ' + e.message); }
+  setTimeout(loop, Math.max(15, 70 - (performance.now() - t0)));
 }
 
 function step() {
-  if (!tracker) {
-    if (cvError) stat('Error: ' + cvError + '. Revisa la conexión y recarga la página.');
-    else if (wantRef) stat('Cargando OpenCV.js (puede tardar unos segundos)… la referencia se fijará al terminar.');
+  cam.grab();
+  if (marking) { drawOverlay(); return; }
+  const img = cam.ctx.getImageData(0, 0, cam.width, cam.height);
+
+  // Referencia automática: al empezar, al marcar el objeto o cuando se pierden los puntos
+  if (needRef || !tracker.tracking) {
+    needRef = false;
+    const n = tracker.setReference(img, roi);
+    frame = 0;
+    if (n < 30) {
+      needRef = true;
+      stat('Pocos detalles en la imagen (' + n + ' puntos). Apunta a un objeto con más textura o más luz.');
+    } else if (!cloud.length) {
+      stat('Siguiendo ' + n + ' puntos. Muévete lentamente de lado alrededor del objeto.');
+    }
     drawOverlay();
     return;
   }
-  const canvas = cam.grab();
 
-  if (wantRef) {
-    wantRef = false;
-    const n = tracker.setReference(canvas, roi);
-    cloud = []; poses = []; frame = 0; nInl = 0; nObj = 0;
-    viewer.setCloud(cloud);
-    stat(n < 30
-      ? 'Pocos puntos detectados (' + n + '). ' + (roi ? 'Agranda el recuadro o busca' : 'Busca') + ' un objeto con más textura y vuelve a fijar.'
-      : 'Referencia fijada con ' + n + ' puntos' + (roi ? ' dentro del recuadro' : '') + '. Mueve el teléfono alrededor del objeto.');
-  } else if (tracker.tracking && !marking) {
-    const s = tracker.track(canvas);
-    frame++;
-    if (s.nAlive < 30) {
-      stat('Quedan pocos puntos (' + s.nAlive + '). Pulsa «Fijar referencia».');
-    } else if (s.parallax < 10) {
-      stat('Puntos: ' + s.nAlive + '. Mueve el teléfono de lado para generar paralaje (' + s.parallax.toFixed(0) + ' px).');
-    } else {
-      if (frame % 3 === 0) reconstruct();
-      stat('Puntos vivos ' + s.nAlive + ' · inliers ' + nInl + (cleanBg ? ' · objeto ' + nObj : '') +
-        ' · paralaje ' + s.parallax.toFixed(0) + ' px · nube ' + cloud.length + ' pts' +
-        (sensors.gMag ? ' · |a| ' + sensors.gMag.toFixed(2) + ' m/s²' : ''));
-    }
+  const s = tracker.track(img);
+  frame++;
+  if (s.nAlive < Math.max(30, 0.35 * tracker.N0)) {
+    needRef = true;   // se perdieron demasiados puntos: nueva referencia (la imagen 3D se mantiene)
+  } else if (s.parallax < 12) {
+    if (!cloud.length) stat('Muévete de lado para ver el objeto desde otro ángulo (' + s.parallax.toFixed(0) + ' px).');
+  } else if (frame % 2 === 0 && performance.now() - lastDense > 1000) {
+    reconstruct(img);
   }
   drawOverlay();
 }
 
-/* ---------- Reconstrucción ---------- */
-function reconstruct() {
-  const fov = parseFloat($('fov').value);
-  const f = cam.focalPx(fov);
-  const ids = tracker.aliveIds();
-  const res = reconstructTwoView(tracker.ref, tracker.cur, ids, f, cam.width / 2, cam.height / 2);
-  if (!res) return;
-  nInl = res.pts.length;
+/* ---------- Reconstrucción: pose (puntos) → profundidad de cada píxel ---------- */
+function reconstruct(img) {
+  if (busy) return;
+  busy = true;
+  try {
+    const fov = parseFloat($('fov').value);
+    const f = cam.focalPx(fov), cx = cam.width / 2, cy = cam.height / 2;
+    const ids = tracker.aliveIds();
+    const res = reconstructTwoView(tracker.ref, tracker.cur, ids, f, cx, cy);
+    if (!res || res.pts.length < 20) { stat('Calculando posición de la cámara… sigue moviéndote lentamente.'); return; }
 
-  // Limpieza de fondo: quedarse con el grupo de puntos más grande (el objeto)
-  const pts = cleanBg ? largestCluster(res.pts) : res.pts;
-  nObj = pts.length;
+    tracker.inl.fill(0);
+    for (const p of res.pts) tracker.inl[p.id] = 1;
 
-  tracker.inl.fill(0);
-  for (const p of pts) tracker.inl[p.id] = 1;
+    // Rango de profundidades del objeto a partir de los puntos triangulados
+    const ds = res.pts.map(p => -p.P[2]).sort((a, b) => a - b);
+    const range = [ds[Math.floor(ds.length * 0.05)], ds[Math.floor(ds.length * 0.95)]];
 
-  const out = normalizeCloud(pts, tracker.col);
-  if (!out) return;
-  cloud = out;
-  viewer.setCloud(cloud);
+    const t0 = performance.now();
+    const dm = denseDepth(tracker.refImage, img, res.R, res.t, f, cx, cy, range, { roi, clean: cleanBg });
+    const ms = performance.now() - t0;
+    lastDense = performance.now();
 
-  poses.push({ t: Math.round(performance.now()), R: res.R, tvec: res.t, inliers: nInl, objeto: nObj, parallax_px: +tracker.parallax.toFixed(1) });
-  if (poses.length > 3000) poses.shift();
+    // Una imagen claramente peor no reemplaza a la actual (salvo que la actual ya tenga más de 5 s)
+    if (cloud.length && dm.count < 0.6 * shownCount && performance.now() - shownAt < 5000) return;
+    const out = depthToCloud(dm);
+    if (!out) { if (!cloud.length) stat('Aún no hay suficiente detalle para la imagen 3D. Muévete un poco más de lado.'); return; }
+    cloud = out;
+    shownCount = dm.count;
+    shownAt = performance.now();
+    viewer.setCloud(cloud);
+    poses.push({ t: Math.round(performance.now()), R: res.R, tvec: res.t, puntos: res.pts.length, pixeles: dm.count, parallax_px: +tracker.parallax.toFixed(1) });
+    if (poses.length > 3000) poses.shift();
+    stat('Imagen 3D: ' + dm.count + ' píxeles con profundidad (' + Math.round(ms) + ' ms). Sigue girando para mejorarla.');
+  } finally {
+    busy = false;
+  }
 }
 
 function drawOverlay() {
   octx.clearRect(0, 0, ov.width, ov.height);
-
-  // Recuadro (confirmado o en dibujo)
   const r = roiDraft || roi;
   if (r) {
     octx.lineWidth = 2;
@@ -218,13 +224,12 @@ function drawOverlay() {
     octx.strokeRect(r.x, r.y, r.w, r.h);
     octx.setLineDash([]);
   }
-
-  if (!tracker || !tracker.tracking) return;
+  if (!tracker.tracking || marking) return;
   for (let i = 0; i < tracker.N; i++) {
     if (!tracker.alive[i]) continue;
     octx.fillStyle = tracker.inl[i] ? '#4cc9f0' : '#3ddc84';
     octx.beginPath();
-    octx.arc(tracker.cur[2 * i], tracker.cur[2 * i + 1], tracker.inl[i] ? 2.6 : 1.8, 0, 6.283);
+    octx.arc(tracker.cur[2 * i], tracker.cur[2 * i + 1], tracker.inl[i] ? 2.4 : 1.6, 0, 6.283);
     octx.fill();
   }
 }
@@ -232,7 +237,8 @@ function drawOverlay() {
 /* ---------- Controles ---------- */
 $('fov').oninput = () => {
   $('fovV').textContent = $('fov').value;
-  if (tracker && tracker.tracking && tracker.nAlive >= 30 && tracker.parallax >= 10) reconstruct();
+  lastDense = 0;
+  shownCount = 0;
 };
 $('ws').oninput = () => {
   const v = parseFloat($('ws').value);
