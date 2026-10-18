@@ -3,7 +3,7 @@
 // referencia se prueban muchas profundidades; se proyecta en la imagen actual y se compara la
 // ventana de alrededor con correlación cruzada normalizada (ZNCC). Gana la profundidad que mejor calza.
 
-export const VERSION = '6';
+export const VERSION = '7';
 
 // Reduce un ImageData por un factor entero (promedio). Devuelve {gray, rgb, w, h}
 function shrink(img, f) {
@@ -208,7 +208,7 @@ export function depthToCloud(dm) {
 }
 
 /*
- * Acumulador: suma muchos mapas de profundidad en la vista de la PRIMERA referencia (K0).
+* Acumulador: suma muchos mapas de profundidad en la vista de la PRIMERA referencia (K0).
  * Cada mapa nuevo viene de otra pareja de vistas, con su propia escala; se lleva a la vista K0
  * con la pose acumulada y se ajusta su escala para que coincida con lo ya medido.
  */
@@ -300,6 +300,17 @@ export class Accumulator {
       }
     }
     const { zbuf, bgw } = this._warp(dm, R0, t0, lam);
+    // Control de coherencia: donde se superpone con lo ya medido, la mayoría debe coincidir.
+    // Si no, la pose de esta medición está mal (por ejemplo, un movimiento brusco) y se descarta entera.
+    if (this.fusions) {
+      let over = 0, agree = 0;
+      for (let i = 0; i < N; i++) {
+        if (!(zbuf[i] > 0) || !this.cnt[i]) continue;
+        over++;
+        if (Math.abs(zbuf[i] - this.mean(i)) < 0.08 * this.mean(i)) agree++;
+      }
+      if (over >= 40 && agree < 0.5 * over) return false;
+    }
     let added = 0;
     for (let i = 0; i < N; i++) {
       if (bgw[i]) this.bg[i]++;
@@ -327,10 +338,12 @@ export class Accumulator {
   }
 
   // Mapa de profundidad para mostrar (vista K0). final=true: rellena huecos chicos y suaviza.
+  // Solo se muestra lo confirmado (medido 2+ veces); al comienzo, con menos de 3 mediciones, se muestra todo
   depthMap(final = false, clean = false) {
     const W = this.w, H = this.h, N = W * H;
+    const minCnt = final || this.fusions >= 3 ? 2 : 1;
     let d = new Float32Array(N);
-    for (let i = 0; i < N; i++) if (this.cnt[i] >= (final && this.fusions >= 3 ? 2 : 1)) d[i] = this.mean(i);
+    for (let i = 0; i < N; i++) if (this.cnt[i] >= minCnt) d[i] = this.mean(i);
     if (clean) {
       // Limpiar fondo sobre el modelo: profundidad típica de la zona del objeto (recuadro o centro) ± 35 %
       const ds = [];
@@ -417,4 +430,5 @@ export class Accumulator {
 
   setIntrinsics(f, cx, cy) { this.f0 = f / this.F; this.cx0 = cx / this.F; this.cy0 = cy / this.F; }
             }
-                              
+
+      
