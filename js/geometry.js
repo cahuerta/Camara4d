@@ -2,7 +2,7 @@
 // Estima la pose relativa entre la referencia y el fotograma actual (matriz esencial, 8 puntos + RANSAC)
 // y triangula los puntos. Convención: X2 = R·X1 + t, con t de norma 1 (escala relativa).
 
-export const VERSION = '4';
+export const VERSION = '5';
 
 export const mul3 = (A, B) => {
   const C = new Array(9).fill(0);
@@ -144,6 +144,181 @@ export function decompose(U, V, X1, X2, inl) {
   return best;
 }
 
+// Matriz de rotación desde un vector de rotación ω (Rodrigues).
+export function rodrigues(w) {
+  const th = Math.hypot(w[0], w[1], w[2]);
+  if (th < 1e-12) return [1, 0, 0, 0, 1, 0, 0, 0, 1];
+  const k = [w[0] / th, w[1] / th, w[2] / th], c = Math.cos(th), s = Math.sin(th), v = 1 - c;
+  return [
+    c + k[0] * k[0] * v, k[0] * k[1] * v - k[2] * s, k[0] * k[2] * v + k[1] * s,
+    k[1] * k[0] * v + k[2] * s, c + k[1] * k[1] * v, k[1] * k[2] * v - k[0] * s,
+    k[2] * k[0] * v - k[1] * s, k[2] * k[1] * v + k[0] * s, c + k[2] * k[2] * v
+  ];
+}
+// Vector de rotación desde una matriz de rotación.
+export function logR(R) {
+  const c = Math.max(-1, Math.min(1, (R[0] + R[4] + R[8] - 1) / 2)), th = Math.acos(c);
+  if (th < 1e-9) return [0, 0, 0];
+  const s = 2 * Math.sin(th);
+  return [(R[7] - R[5]) / s * th, (R[2] - R[6]) / s * th, (R[3] - R[1]) / s * th];
+}
+
+// Para una rotación dada, la traslación (dirección) sale de forma lineal: tᵀ·((R·x1) × x2) = 0.
+// Devuelve {t, cost, res} donde res son los residuos por punto.
+function bestT(R, X1, X2, idx, tPrev) {
+  const S = new Array(9).fill(0), rows = [];
+  for (const i of idx) {
+    const a = mv3(R, [X1[i][0], X1[i][1], 1]), b = [X2[i][0], X2[i][1], 1];
+    const r = cross(a, b);
+    rows.push(r);
+    for (let p = 0; p < 3; p++) for (let q = 0; q < 3; q++) S[3 * p + q] += r[p] * r[q];
+  }
+  const { vals, V } = jacobi(S, 3);
+  let m = 0;
+  for (let i = 1; i < 3; i++) if (vals[i] < vals[m]) m = i;
+  let t = [V[m], V[3 + m], V[6 + m]];
+  if (tPrev && dot(t, tPrev) < 0) t = t.map(x => -x);
+  const res = rows.map(r => dot(r, t));
+  return { t, res, cost: res.reduce((a, b) => a + b * b, 0) };
+}
+
+// Residuos de Sampson (distancia geométrica, en coordenadas normalizadas) para una pose (R, t).
+function sampsonRes(R, t, X1, X2, idx, sigma = 0) {
+  const E = essentialFrom(R, t), out = new Float64Array(idx.length);
+  for (let k = 0; k < idx.length; k++) {
+    const i = idx[k], a = [X1[i][0], X1[i][1], 1], b = [X2[i][0], X2[i][1], 1];
+    const Ea = mv3(E, a), Etb = mv3(tr3(E), b);
+    const den = Math.sqrt(Ea[0] ** 2 + Ea[1] ** 2 + Etb[0] ** 2 + Etb[1] ** 2) || 1e-12;
+    const r = dot(b, Ea) / den;
+    // Con sigma > 0: pérdida robusta de Cauchy (los pares erróneos pesan poco)
+    out[k] = sigma > 0 ? Math.sign(r) * sigma * Math.sqrt(Math.log1p((r / sigma) ** 2)) : r;
+  }
+  return out;
+}
+
+// Base tangente a la esfera unitaria en t
+function tangent(t) {
+  const a = Math.abs(t[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0];
+  const e1 = cross(t, a), n1 = Math.hypot(...e1);
+  const u = e1.map(x => x / n1), v = cross(t, u);
+  return [u, v];
+}
+
+// Afinamiento de la pose (Levenberg-Marquardt) sobre 5 parámetros: rotación (3) y dirección de t (2),
+// minimizando la distancia de Sampson de todos los pares. Funciona también con escenas casi planas.
+export function refinePose(X1, X2, idx, w0, t0 = null, iters = 40, sigma = 0) {
+  let w = w0.slice();
+  let t = t0 ? t0.slice() : bestT(rodrigues(w), X1, X2, idx, null).t;
+  const nt = Math.hypot(...t); t = t.map(x => x / nt);
+  let res = sampsonRes(rodrigues(w), t, X1, X2, idx, sigma);
+  let cost = res.reduce((a, b) => a + b * b, 0), lambda = 1e-3;
+  const apply = (wb, tb, d, B) => {
+    const wn = [wb[0] + d[0], wb[1] + d[1], wb[2] + d[2]];
+    const tn = tb.map((x, k) => x + d[3] * B[0][k] + d[4] * B[1][k]);
+    const n = Math.hypot(...tn);
+    return [wn, tn.map(x => x / n)];
+  };
+  for (let it = 0; it < iters; it++) {
+    const B = tangent(t), h = 1e-7, J = [];
+    for (let k = 0; k < 5; k++) {
+      const d = [0, 0, 0, 0, 0]; d[k] = h;
+      const [wk, tk] = apply(w, t, d, B);
+      const rk = sampsonRes(rodrigues(wk), tk, X1, X2, idx, sigma);
+      J.push(Array.from(rk, (v, i) => (v - res[i]) / h));
+    }
+    const A = new Array(25).fill(0), g = [0, 0, 0, 0, 0];
+    for (let i = 0; i < res.length; i++) for (let p = 0; p < 5; p++) {
+      g[p] += J[p][i] * res[i];
+      for (let q = 0; q < 5; q++) A[5 * p + q] += J[p][i] * J[q][i];
+    }
+    let improved = false;
+    for (let tries = 0; tries < 10; tries++) {
+      const M = A.slice();
+      for (let p = 0; p < 5; p++) M[6 * p] += lambda * (A[6 * p] + 1e-15);
+      const d = solveN(M, g.map(x => -x), 5);
+      if (!d) { lambda *= 10; continue; }
+      const [wn, tn] = apply(w, t, d, B);
+      const rn = sampsonRes(rodrigues(wn), tn, X1, X2, idx, sigma);
+      const cn = rn.reduce((a, b) => a + b * b, 0);
+      if (cn < cost) {
+        const rel = (cost - cn) / cost;
+        w = wn; t = tn; res = rn; cost = cn; lambda = Math.max(1e-9, lambda / 4); improved = true;
+        if (rel < 1e-9) it = iters;
+        break;
+      }
+      lambda *= 10;
+    }
+    if (!improved) break;
+  }
+  return { w, R: rodrigues(w), t, cost };
+}
+
+// Resuelve M·x = b (n×n) por eliminación de Gauss con pivoteo.
+function solveN(M, b, n) {
+  const A = [];
+  for (let i = 0; i < n; i++) A.push([...M.slice(n * i, n * i + n), b[i]]);
+  for (let c = 0; c < n; c++) {
+    let p = c;
+    for (let r = c + 1; r < n; r++) if (Math.abs(A[r][c]) > Math.abs(A[p][c])) p = r;
+    if (Math.abs(A[p][c]) < 1e-30) return null;
+    [A[c], A[p]] = [A[p], A[c]];
+    for (let r = c + 1; r < n; r++) {
+      const k = A[r][c] / A[c][c];
+      for (let j = c; j <= n; j++) A[r][j] -= k * A[c][j];
+    }
+  }
+  const x = new Array(n).fill(0);
+  for (let r = n - 1; r >= 0; r--) {
+    let v = A[r][n];
+    for (let j = r + 1; j < n; j++) v -= A[r][j] * x[j];
+    x[r] = v / A[r][r];
+  }
+  return x;
+}
+
+// Pose robusta entre dos vistas: inliers por RANSAC (8 puntos) y luego afinamiento partiendo de
+// "sin rotación" y de las soluciones de 8 puntos; gana la que mejor explica los datos.
+export function estimatePose(X1, X2, f) {
+  const N = X1.length;
+  if (N < 14) return null;
+  const all = Array.from({ length: N }, (_, i) => i);
+  const sigma = 1.5 / f, th2 = (2.5 / f) ** 2;
+  // Puntos de partida: sin giro (lo normal con la mano) y las soluciones del método de 8 puntos
+  const starts = [{ w: [0, 0, 0], t: null }];
+  const r = ransacE(X1, X2, f);
+  if (r) {
+    const W = [0, -1, 0, 1, 0, 0, 0, 0, 1], tE = [r.U[2], r.U[5], r.U[8]];
+    for (const Rc of [mul3(mul3(r.U, W), tr3(r.V)), mul3(mul3(r.U, tr3(W)), tr3(r.V))]) {
+      const w = logR(Rc);
+      if (Math.hypot(w[0], w[1], w[2]) < 0.8) starts.push({ w, t: tE });
+    }
+  }
+  let best = null;
+  for (const st of starts) {
+    // 1) ajuste robusto con todos los puntos  2) inliers  3) ajuste fino solo con inliers
+    let sol = refinePose(X1, X2, all, st.w, st.t, 40, sigma);
+    const E = essentialFrom(sol.R, sol.t);
+    const inl = [];
+    for (let i = 0; i < N; i++) if (sampson2(E, X1[i], X2[i]) < th2) inl.push(i);
+    if (inl.length < 12) continue;
+    sol = { ...refinePose(X1, X2, inl, sol.w, sol.t), inl };
+    sol.err = sol.cost / inl.length;
+    if (!best || inl.length > best.inl.length * 1.05 ||
+        (inl.length >= best.inl.length * 0.95 && sol.err < best.err)) best = sol;
+  }
+  if (!best) return null;
+  // Signo de t: la mayoría de los puntos debe quedar delante de ambas cámaras
+  let front = 0;
+  for (const i of best.inl) { const p = tri(best.R, best.t, X1[i], X2[i]); if (p && p.s1 > 0 && p.s2 > 0) front++; }
+  if (front < best.inl.length / 2) best.t = best.t.map(x => -x);
+  return { R: best.R, t: best.t, inl: best.inl };
+}
+
+export function essentialFrom(R, t) {
+  const T = [0, -t[2], t[1], t[2], 0, -t[0], -t[1], t[0], 0];
+  return mul3(T, R);
+}
+
 // Reconstrucción de dos vistas.
 //  ref, cur: Float32Array planos [x0,y0,x1,y1,...] en píxeles; ids: índices de los puntos vivos;
 //  f: focal en px; (cx,cy): centro óptico; maxErr: error máximo de reproyección en px.
@@ -151,12 +326,10 @@ export function decompose(U, V, X1, X2, inl) {
 export function reconstructTwoView(ref, cur, ids, f, cx, cy, maxErr = 3) {
   const X1 = ids.map(i => [(ref[2 * i] - cx) / f, (ref[2 * i + 1] - cy) / f]);
   const X2 = ids.map(i => [(cur[2 * i] - cx) / f, (cur[2 * i + 1] - cy) / f]);
-  const res = ransacE(X1, X2, f);
-  if (!res) return null;
-  const pose = decompose(res.U, res.V, X1, X2, res.inl);
+  const pose = estimatePose(X1, X2, f);
   if (!pose) return null;
   const pts = [];
-  for (const k of res.inl) {
+  for (const k of pose.inl) {
     const p = tri(pose.R, pose.t, X1[k], X2[k]);
     if (!p || p.s1 <= 0 || p.s2 <= 0) continue;
     const X2c = mv3(pose.R, p.X).map((v, j) => v + pose.t[j]);
@@ -221,4 +394,5 @@ export function normalizeCloud(pts, colors) {
   return out.length >= 15 ? out : null;
                         }
 
-                               
+
+    
