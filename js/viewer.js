@@ -5,11 +5,11 @@ export class Viewer {
   constructor(canvas) {
     this.c = canvas;
     this.ctx = canvas.getContext('2d');
-    this.ang = { xy: 0, xz: -0.4, yz: 0.25, xw: 0, yw: 0, zw: 0 };
+    this.ang = { xy: 0, xz: -0.25, yz: 0.15, xw: 0, yw: 0, zw: 0 };
     this.mode = '3d';
     this.auto = false;
     this.zoom = 1;
-    this.wScale = 1;
+    this.wScale = 0;
     this.cloud = [];
     this._ptr = new Map();
     this._pinch = 0;
@@ -27,7 +27,7 @@ export class Viewer {
   zoomBy(k) { this.zoom = Math.min(8, Math.max(0.25, this.zoom * k)); }
   resetView() {
     this.zoom = 1;
-    this.ang = { xy: 0, xz: -0.4, yz: 0.25, xw: 0, yw: 0, zw: 0 };
+    this.ang = { xy: 0, xz: -0.25, yz: 0.15, xw: 0, yw: 0, zw: 0 };
   }
 
   fit() {
@@ -90,7 +90,7 @@ export class Viewer {
     const k4 = D4 / Math.max(0.5, D4 - p[3] * this.wScale);
     const x = p[0] * k4, y = p[1] * k4, z = p[2] * k4;
     const k3 = D3 / Math.max(0.5, D3 - z);
-    return [x * k3, -y * k3, z, k3];
+    return [x * k3, -y * k3, z, k3 * k4];
   }
 
   _render(now) {
@@ -99,7 +99,7 @@ export class Viewer {
     if (this.auto) { this.ang.xw += 0.4 * dt; this.ang.zw += 0.25 * dt; this.ang.xy += 0.1 * dt; }
 
     const ctx = this.ctx, W = this.c.width, H = this.c.height, d = window.devicePixelRatio || 1;
-    const sc = Math.min(W, H) * 0.17 * this.zoom;
+    const sc = Math.min(W, H) * 0.26 * this.zoom;
     ctx.clearRect(0, 0, W, H);
 
     // Ejes: X rojo, Y verde, Z azul, W blanco
@@ -128,7 +128,8 @@ export class Viewer {
       const arr = this.cloud.map(c => ({ q: this._proj(this._xform([c[0], c[1], c[2], c[3]])), c }));
       arr.sort((a, b) => a.q[2] - b.q[2]);
       for (const it of arr) {
-        const s = Math.max(1.5, 3 * it.q[3]) * d;
+        // Puntos densos (con tamaño propio) se dibujan del tamaño de su píxel para formar una superficie continua
+        const s = it.c.length > 7 ? Math.max(1.2 * d, it.c[7] * it.q[3] * sc) : Math.max(1.5, 3 * it.q[3]) * d;
         ctx.fillStyle = 'rgb(' + it.c[4] + ',' + it.c[5] + ',' + it.c[6] + ')';
         ctx.fillRect(W / 2 + it.q[0] * sc - s / 2, H / 2 + it.q[1] * sc - s / 2, s, s);
       }
