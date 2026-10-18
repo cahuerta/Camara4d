@@ -6,6 +6,8 @@ h1{font-size:18px;margin:4px 0 10px}
 .vid{position:relative;width:100%;background:#000;border-radius:10px;overflow:hidden;min-height:120px}
 .vid video{width:100%;display:block}
 .vid canvas{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
+.vid.marking canvas{pointer-events:auto;touch-action:none;cursor:crosshair}
+.vid.marking{outline:2px dashed var(--ac);outline-offset:-2px}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px}
 button{background:#1d2330;color:var(--tx);border:1px solid var(--line);border-radius:9px;padding:9px 12px;font-size:14px}
 button.pri{background:var(--ac);color:#04121a;border-color:var(--ac);font-weight:600}
