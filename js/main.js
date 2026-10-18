@@ -15,6 +15,7 @@ const viewer = new Viewer($('view'));
 const ov = $('ov'), octx = ov.getContext('2d');
 
 let tracker = null;
+let cvError = null;   // mensaje si OpenCV.js no pudo cargar
 let running = false, wantRef = false;
 let cloud = [], poses = [], frame = 0, nInl = 0;
 let lastMsg = '';
@@ -24,7 +25,7 @@ const stat = m => { if (m !== lastMsg) { $('status').textContent = m; lastMsg = 
 /* ---------- OpenCV ---------- */
 loadOpenCV()
   .then(cv => { tracker = new Tracker(cv); })
-  .catch(e => stat('Error: ' + e.message));
+  .catch(e => { cvError = e.message; stat('Error: ' + e.message + '. Revisa la conexión y recarga la página.'); });
 
 /* ---------- Cámara ---------- */
 $('bStart').onclick = async () => {
@@ -54,7 +55,12 @@ function loop() {
 }
 
 function step() {
-  if (!tracker) { stat('Cargando OpenCV.js…'); return; }
+  if (!tracker) {
+    stat(cvError
+      ? 'Error: ' + cvError + '. Revisa la conexión y recarga la página.'
+      : 'Cámara lista. Cargando OpenCV.js (puede tardar unos segundos)…');
+    return;
+  }
   const canvas = cam.grab();
 
   if (wantRef) {
@@ -145,4 +151,4 @@ $('bExp').onclick = () => exportJSON({
   fov: parseFloat($('fov').value),
   size: { w: cam.width, h: cam.height }
 });
-  
+
