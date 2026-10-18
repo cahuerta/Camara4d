@@ -2,6 +2,8 @@
 // Estima la pose relativa entre la referencia y el fotograma actual (matriz esencial, 8 puntos + RANSAC)
 // y triangula los puntos. Convención: X2 = R·X1 + t, con t de norma 1 (escala relativa).
 
+export const VERSION = '4';
+
 export const mul3 = (A, B) => {
   const C = new Array(9).fill(0);
   for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) for (let k = 0; k < 3; k++) C[3 * i + j] += A[3 * i + k] * B[3 * k + j];
@@ -218,4 +220,5 @@ export function normalizeCloud(pts, colors) {
   });
   return out.length >= 15 ? out : null;
                         }
-    
+
+                               
