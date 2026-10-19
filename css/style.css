@@ -38,3 +38,11 @@ small{color:var(--mut);display:block;margin-top:8px}
 .as-arrow.arr{top:8px;left:50%;transform:translateX(-50%)}
 .as-arrow.aba{bottom:52px;left:50%;transform:translateX(-50%)}
 @keyframes as-pulse{50%{opacity:.35}}
+/* Panel de tomas (lo crea main.js) */
+.tomas{width:100%;border:1px solid var(--line);border-radius:10px;padding:8px;background:#10141c}
+.tm-head{font-size:12px;color:var(--mut);margin-bottom:6px}
+.tm-row{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:6px;padding:6px 0;border-top:1px solid var(--line);font-size:13px}
+.tm-row label{display:flex;flex-direction:row;align-items:center;gap:6px;flex:1;min-width:180px;color:var(--tx);font-size:13px}
+.tm-row small{display:inline;margin:0}
+.tm-btns{display:flex;gap:6px}
+.tm-btns button{padding:6px 10px;font-size:13px}
