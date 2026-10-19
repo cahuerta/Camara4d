@@ -3,7 +3,7 @@
 // referencia se prueban muchas profundidades; se proyecta en la imagen actual y se compara la
 // ventana de alrededor con correlación cruzada normalizada (ZNCC). Gana la profundidad que mejor calza.
 
-export const VERSION = '7';
+export const VERSION = '8';
 
 // Reduce un ImageData por un factor entero (promedio). Devuelve {gray, rgb, w, h}
 function shrink(img, f) {
@@ -219,6 +219,7 @@ export class Accumulator {
     this.w = A.w; this.h = A.h; this.rgb = A.rgb; this.gray = A.gray;
     const N = this.w * this.h;
     this.sum = new Float32Array(N);      // suma de profundidades
+    this.sum2 = new Float32Array(N);     // suma de cuadrados (para medir cuánto varía cada píxel)
     this.cnt = new Uint16Array(N);       // cuántas veces se midió cada píxel
     this.bg = new Uint16Array(N);        // cuántas veces se marcó como fondo
     this.fusions = 0;
@@ -317,7 +318,7 @@ export class Accumulator {
       const z = zbuf[i];
       if (!(z > 0)) continue;
       if (this.cnt[i] >= 2 && Math.abs(z - this.mean(i)) > 0.08 * this.mean(i)) continue;   // medición discordante
-      this.sum[i] += z; this.cnt[i]++; added++;
+      this.sum[i] += z; this.sum2[i] += z * z; this.cnt[i]++; added++;
     }
     if (added < 20) return false;
     this.scale = lam;
@@ -338,12 +339,22 @@ export class Accumulator {
   }
 
   // Mapa de profundidad para mostrar (vista K0). final=true: rellena huecos chicos y suaviza.
-  // Solo se muestra lo confirmado (medido 2+ veces); al comienzo, con menos de 3 mediciones, se muestra todo
+  // Solo se muestra lo confirmado: medido 2+ veces (3+ cuando ya hay 6 mediciones) y que no varíe mucho
+  // entre mediciones (más de 3 %: es un píxel dudoso). Al comienzo, con menos de 3 mediciones, se muestra todo.
   depthMap(final = false, clean = false) {
     const W = this.w, H = this.h, N = W * H;
-    const minCnt = final || this.fusions >= 3 ? 2 : 1;
+    const minCnt = this.fusions >= 6 ? 3 : final || this.fusions >= 3 ? 2 : 1;
     let d = new Float32Array(N);
-    for (let i = 0; i < N; i++) if (this.cnt[i] >= minCnt) d[i] = this.mean(i);
+    for (let i = 0; i < N; i++) {
+      const c = this.cnt[i];
+      if (c < minCnt) continue;
+      const m = this.sum[i] / c;
+      if (c >= 2) {
+        const sd = Math.sqrt(Math.max(0, this.sum2[i] / c - m * m));
+        if (sd > 0.03 * m) continue;
+      }
+      d[i] = m;
+    }
     if (clean) {
       // Limpiar fondo sobre el modelo: profundidad típica de la zona del objeto (recuadro o centro) ± 35 %
       const ds = [];
@@ -430,5 +441,3 @@ export class Accumulator {
 
   setIntrinsics(f, cx, cy) { this.f0 = f / this.F; this.cx0 = cx / this.F; this.cy0 = cy / this.F; }
             }
-
-      
