@@ -46,3 +46,44 @@ small{color:var(--mut);display:block;margin-top:8px}
 .tm-row small{display:inline;margin:0}
 .tm-btns{display:flex;gap:6px}
 .tm-btns button{padding:6px 10px;font-size:13px}
+/* ---------- Pantalla tipo app (v13): menú arriba y 3 pantallas (las arma main.js) ---------- */
+body.app{padding:0 0 calc(24px + env(safe-area-inset-bottom));max-width:760px}
+body.app #err{margin:8px 10px}
+.top{position:sticky;top:0;z-index:20;background:rgba(11,13,18,.94);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);border-bottom:1px solid var(--line);padding:calc(6px + env(safe-area-inset-top)) 10px 8px}
+.top h1{font-size:16px;margin:0 0 8px;display:flex;align-items:baseline;gap:8px}
+.top h1 span{font-size:12px;color:var(--mut);font-weight:400}
+.tabs{display:grid;grid-template-columns:repeat(3,1fr);gap:4px;background:#10141c;border:1px solid var(--line);border-radius:12px;padding:4px}
+.tabs button{display:flex;flex-direction:column;align-items:center;gap:1px;border:0;background:transparent;border-radius:9px;padding:6px 4px;font-size:12px;color:var(--mut);position:relative}
+.tabs button i{font-style:normal;font-size:20px;line-height:1.1}
+.tabs button.on{background:#1f2633;color:var(--tx);box-shadow:inset 0 0 0 1px var(--ac)}
+.tabs button.rec::after{content:"";position:absolute;top:6px;right:10px;width:9px;height:9px;border-radius:50%;background:#ff4d4d;animation:as-pulse 1s infinite}
+.page{padding:10px}
+.page[hidden]{display:none}
+body.app .box{margin-bottom:10px}
+/* Captura */
+body.app .vid{width:100%;max-width:100%}
+body.app .vid video{width:100%;max-height:58vh;object-fit:contain}
+.cap-main{display:grid;grid-template-columns:1fr;gap:8px}
+button.big{width:100%;min-height:54px;font-size:17px;font-weight:600;border-radius:14px}
+button.big.stop{background:#ff4d4d;border-color:#ff4d4d;color:#fff}
+#bStart:disabled,#bEnd:disabled,#bNew:disabled{display:none}
+.cap-main #bExp{display:none}
+.cap-sec button{flex:1}
+.cap-sec button:disabled{display:none}
+.cap-adv{opacity:.85}
+body.app #status{font-size:14px;color:var(--tx);opacity:.8}
+/* Resultado */
+body.app #view{height:62vh;min-height:300px}
+.res-note{font-size:13px;color:var(--mut);margin:0 2px 8px}
+.res-note:empty{display:none}
+/* Tomas */
+.srv{font-size:13px;padding:8px 10px;border-radius:10px;margin-bottom:8px;border:1px solid var(--line)}
+.srv.ok{color:#3ddc84;border-color:#1f5e3c;background:#0f1f17}
+.srv.wait{color:#f7c948;border-color:#5e4f1f;background:#1f1a0f}
+.srv.bad{color:#ffb3b3;border-color:#5e1f24;background:#1f0f11}
+body.app .tomas{border:0;padding:0;background:transparent}
+.tm-row{padding:10px 0}
+.tm-row label{min-width:0}
+.tm-row input[type=checkbox]{width:22px;height:22px;flex:none}
+.tm-btns button{min-height:38px}
+.tomas .row button{flex:1;min-height:48px}
