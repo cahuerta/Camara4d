@@ -16,7 +16,7 @@ import { Sensors } from './sensors.js';
 import { Viewer } from './viewer.js';
 import { exportJSON } from './export.js';
 import { Assist, VERSION as ASSIST_VERSION } from './assist.js';
-import { Model, camCenter, toWorld, localTomas, serverApi, VERSION as MODEL_VERSION } from './fragments.js';
+import { Model, camCenter, toWorld, localTomas, serverApi, alignModels, movePose, b64, VERSION as MODEL_VERSION } from './fragments.js';
 
 const $ = id => document.getElementById(id);
 
@@ -24,10 +24,41 @@ const cam = new Camera($('video'), document.createElement('canvas'));
 const sensors = new Sensors();
 const viewer = new Viewer($('view'));
 const tracker = new Tracker();
-const model = new Model();
+let model = new Model();             // tramo activo de la captura (todo se suma aquí)
 const ov = $('ov'), octx = ov.getContext('2d');
 const vidBox = ov.parentElement;
 const assist = new Assist({ vidBox, controls: $('controls') });
+
+/* ---------- Grabación de prueba (automática) ----------
+   Mientras se captura se guardan cuadros de la cámara (1 de cada 3, en JPEG). Al terminar se pueden bajar desde
+   «Resultado» como un archivo para revisar o reproducir exactamente lo que vio la cámara. */
+const rec = {
+  frames: [], on: false, busy: 0, intr: null,
+  start() { this.frames = []; this.on = true; this.busy = 0; },
+  frame(no) {
+    if (!this.on || no % 3 || this.frames.length >= 600 || this.busy > 2) return;
+    this.busy++;
+    const t = Math.round(performance.now());
+    cam.ctx.canvas.toBlob(b => { this.busy--; if (b && this.on) this.frames.push({ t, b }); }, 'image/jpeg', 0.75);
+  },
+  stop(intr) { this.on = false; this.intr = intr; },
+  async download() {
+    if (!this.frames.length) return;
+    const parts = ['{"formato":"camara4d-grabacion","version":1,"app":"' + APP_VERSION + '","fov":' + (this.intr ? this.intr.fov : parseFloat($('fov').value)) +
+      ',"w":' + cam.width + ',"h":' + cam.height + ',"cuadros":['];
+    for (let i = 0; i < this.frames.length; i++) {
+      const u8 = new Uint8Array(await this.frames[i].b.arrayBuffer());
+      parts.push((i ? ',' : '') + '{"t":' + this.frames[i].t + ',"jpg":"' + b64(u8) + '"}');
+    }
+    parts.push(']}');
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob(parts, { type: 'application/json' }));
+    a.download = 'camara4d-grabacion-' + new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-') + '.json';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+  }
+};
 
 const FACTOR = 2;                    // la profundidad se calcula a la mitad de la resolución de trabajo
 const KF_BASE = 0.10;                // nueva vista guardada al moverse ~10 % de la distancia al objeto…
@@ -46,6 +77,12 @@ let jobs = [], jobBusy = false;
 let relocAt = 0, viewAt = 0, viewProj = null, cloudAt = 0;
 let poses = [], cloud = [], frameNo = 0;
 let lastMsg = '';
+// Tramos: si se pierde el objeto, la captura NO se detiene: empieza un tramo nuevo al tiro y sigue grabando.
+// Cuando el tramo nuevo reconoce una parte ya capturada, se une solo al modelo anterior. Los que no se alcancen
+// a unir en el teléfono se unen al terminar, o en el servidor.
+let parts = [];                      // tramos anteriores sin unir: { model, kfList, roiObject }
+let linkAt = 0, linkKfs = 0, curJob = null;
+const simApply = (T, p) => { const q = mv3(T.R, p); return [T.s * q[0] + T.t[0], T.s * q[1] + T.t[1], T.s * q[2] + T.t[2]]; };
 
 // Recuadro del objeto (en píxeles del canvas de trabajo) y limpieza de fondo
 let roi = null, roiDraft = null, marking = false, dragStart = null, cleanBg = true;
@@ -56,19 +93,19 @@ const med = a => { if (!a.length) return 0; const q = a.slice().sort((x, y) => x
 
 /* ---------- Versión y textos de la página ---------- */
 // index.html es fijo: la versión, los textos y los controles nuevos los pone este archivo.
-const APP_VERSION = '13';
+const APP_VERSION = '14';
 const showErr = m => (window.showAppError ? window.showAppError(m) : stat(m));
 $('title').innerHTML = 'Cámara 4D <span>v' + APP_VERSION + '</span>';
 $('help').textContent = 'El modelo 3D se arma con la profundidad de cada píxel y crece con cada vista. Un dedo gira, el pellizco (o la rueda del mouse) acerca y aleja. ' +
   'w = intensidad de cada punto (oscuro −1, claro +1); con peso 0 ves el modelo normal.';
-stat('Pulsa «Iniciar cámara» y gira alrededor del objeto. Todo se suma a un solo modelo; si pierdes el objeto, vuelve a apuntarlo y sigue. Solo «Terminar» detiene la captura.');
+stat('Pulsa «Iniciar cámara» y gira alrededor del objeto. Todo se suma a un solo modelo; si se pierde el seguimiento, la grabación sigue sola y lo nuevo se une después. Solo «Terminar» detiene la captura.');
 {
   const bad = [];
   if (TRACKER_VERSION !== '6') bad.push('js/tracker.js');
   if (GEOMETRY_VERSION !== '6') bad.push('js/geometry.js');
   if (DENSE_VERSION !== '8') bad.push('js/dense.js');
   if (ASSIST_VERSION !== '3') bad.push('js/assist.js');
-  if (MODEL_VERSION !== '2') bad.push('js/fragments.js');
+  if (MODEL_VERSION !== '3') bad.push('js/fragments.js');
   if (bad.length) showErr('Archivos de otra versión: ' + bad.join(', ') + '. Súbelos de nuevo.');
 }
 
@@ -146,7 +183,9 @@ async function startCamera() {
     ov.width = cam.width;
     ov.height = cam.height;
     running = true;
-    model.clear();
+    model = new Model();
+    parts = [];
+    rec.start();
     resetCapture();
     viewer.setCloud([]);
     updateProgress();
@@ -171,7 +210,7 @@ function resetCapture() {
   state = 'idle';
   pose = null; fails = 0;
   kfSeq = 0; kfList = []; lastKf = null; kf0 = null;
-  jobs = []; jobBusy = false;
+  jobs = []; jobBusy = false; curJob = null; linkAt = 0; linkKfs = 0;
   poses = []; cloud = []; frameNo = 0; viewProj = null;
   tracker.reset();
   assist.reset();
@@ -203,10 +242,14 @@ function step() {
   if (marking) { drawOverlay(); return; }
   const img = cam.ctx.getImageData(0, 0, cam.width, cam.height);
   frameNo++;
+  rec.frame(frameNo);
   if (state === 'idle') startInit(img);
   else if (state === 'init') stepInit(img);
   else if (state === 'track') stepTrack(img);
-  else if (state === 'lost') stepLost(img);
+  // Tramo nuevo que aún no arranca: se intenta reconocer lo ya capturado para volver al mismo modelo
+  if ((state === 'idle' || state === 'init') && parts.length) tryResume(img);
+  // Tramo activo con datos: se intenta unir con los tramos anteriores
+  if (state === 'track' && parts.length) tryLink();
   if (state === 'track' && pose && performance.now() - viewAt > 300) {
     viewProj = model.project(pose.R, pose.t, intr.f, intr.cx, intr.cy, intr.w, intr.h, 4);
     viewAt = performance.now();
@@ -221,11 +264,10 @@ function startInit(img) {
   intr = { f: cam.focalPx(fov), cx: cam.width / 2, cy: cam.height / 2, w: cam.width, h: cam.height, fov };
   tracker.reset();
   tracker.start(img);
-  kf0 = { id: 0, img, R: I3(), t: [0, 0, 0] };
-  const n = tracker.addCorners(0, null, roi);
+  kf0 = { id: ++kfSeq, img, R: I3(), t: [0, 0, 0], sc: 1 };
+  const n = tracker.addCorners(kf0.id, null, roi);
   for (const p of tracker.pts) { p.oR = I3(); p.ot = [0, 0, 0]; }
   if (n < 40) { stat('Pocos detalles en la imagen (' + n + ' puntos). Apunta a un objeto con más textura o más luz.'); return; }
-  kfSeq = 0;
   kfList = [kf0];
   state = 'init';
 }
@@ -248,7 +290,7 @@ function stepInit(img) {
   // Escala del modelo: la profundidad típica de esta primera vista vale 1
   const s = 1 / med(res.pts.map(p => -p.P[2]));
   for (const p of res.pts) { pts[p.id].X = [p.P[0] * s, -p.P[1] * s, -p.P[2] * s]; pts[p.id].ver = true; }
-  const kf1 = { id: ++kfSeq, img, R: res.R, t: res.t.map(v => v * s) };
+  const kf1 = { id: ++kfSeq, img, R: res.R, t: res.t.map(v => v * s), sc: 1 };
   kfList.push(kf1);
   pose = { R: kf1.R, t: kf1.t };
   lastKf = kf1;
@@ -293,7 +335,7 @@ function stepTrack(img) {
     }
   }
   if (ok) fails = 0; else fails++;
-  if (fails >= 4 || tracker.count < 12) { goLost(); return; }
+  if (fails >= 4 || tracker.count < 12) { newSegment(); return; }
   if (!ok) return;
 
   // Puntos sin posición 3D: se triangulan con el movimiento de la cámara desde donde nacieron
@@ -361,7 +403,7 @@ function stampOrigin() {
 }
 
 function createKf(img) {
-  const kf = { id: ++kfSeq, img, R: pose.R.slice(), t: pose.t.slice() };
+  const kf = { id: ++kfSeq, img, R: pose.R.slice(), t: pose.t.slice(), sc: 1 };
   let pair = lastKf && lastKf.img ? lastKf : null;
   if (!pair) {
     const C = camCenter(kf.R, kf.t);
@@ -390,7 +432,7 @@ function queueDense(refKf, otherKf) {
   for (const p of tracker.pts) if (p.X) zs.push(R3z(refKf, p.X));
   const valid = zs.filter(z => z > 0).sort((a, b) => a - b);
   const range = valid.length >= 10 ? [valid[Math.floor(valid.length * 0.05)], valid[Math.floor(valid.length * 0.95)]] : [0.6, 1.6];
-  jobs.push({ cap: capNo, ref: refKf, other: otherKf, R: Rr, t: tr, range });
+  jobs.push({ cap: capNo, ref: refKf, other: otherKf, R: Rr, t: tr, range, sc0: refKf.sc, mdl: model, list: kfList });
   pump();
 }
 
@@ -399,30 +441,38 @@ function pump() {
   const j = jobs.shift();
   if (!j.ref.img || !j.other.img) { pump(); return; }
   jobBusy = true;
+  curJob = j;
   const copy = im => ({ data: new Uint8ClampedArray(im.data), width: im.width, height: im.height });
   const ref = copy(j.ref.img), cur = copy(j.other.img);
   runJob({ type: 'dense', ref, cur, R: j.R, t: j.t, f: intr.f, cx: intr.cx, cy: intr.cy, range: j.range, opts: { factor: FACTOR, roi: null, clean: false } },
     [ref.data.buffer, cur.data.buffer], r => {
       jobBusy = false;
-      if (j.cap === capNo && !r.error && r.dm) onDepth(j.ref, r.dm);
+      curJob = null;
+      if (j.cap === capNo && !r.error && r.dm) {
+        // Si el tramo se unió a otro mientras se calculaba, la profundidad se lleva a las unidades nuevas
+        const k = j.ref.sc / j.sc0;
+        if (k !== 1) for (let i = 0; i < r.dm.depth.length; i++) r.dm.depth[i] *= k;
+        onDepth(j.ref, r.dm, j.mdl, j.list);
+      }
       else if (r.error) showErr('Cálculo de profundidad: ' + r.error);
       pump();
     });
 }
 
-function onDepth(kf, dm) {
+function onDepth(kf, dm, M = model, L = kfList) {
+  const active = M === model;
   // Tamaño del cubito: según la distancia al objeto (centro de la imagen o recuadro) en la primera vista,
   // para que el detalle del objeto no dependa de lo lejos que esté el fondo
-  if (!model.depthMaps) {
+  if (!M.depthMaps) {
     const r = roi || { x: intr.w * 0.3, y: intr.h * 0.3, w: intr.w * 0.4, h: intr.h * 0.4 };
     const ds = [];
     for (let y = Math.floor(r.y / FACTOR); y < (r.y + r.h) / FACTOR; y++) for (let x = Math.floor(r.x / FACTOR); x < (r.x + r.w) / FACTOR; x++) {
       const d = dm.depth[y * dm.w + x];
       if (d > 0) ds.push(d);
     }
-    if (ds.length > 30) model.voxel = med(ds) * 2.5 / dm.f;
+    if (ds.length > 30) M.voxel = med(ds) * 2.5 / dm.f;
   }
-  model.fuseDepth(dm, kf.R, kf.t, kf.id);
+  M.fuseDepth(dm, kf.R, kf.t, kf.id);
   kf.hasDepth = true;
   const F = FACTOR, f = intr.f, cx = intr.cx, cy = intr.cy;
   // Posición 3D de un píxel de esta vista según su mapa de profundidad
@@ -448,9 +498,9 @@ function onDepth(kf, dm) {
     kf.dc = ds.length > 5 ? med(ds) : 0;
   }
   // Esfera del objeto (para limpiar el fondo)
-  if (!roiObject) updateObject(kf, look);
+  if (!(active && roiObject)) updateObject(kf, look, M, L);
   // Los puntos que nacieron en esta vista reciben su posición 3D
-  tracker.fill3D(kf.id, look);
+  if (active) tracker.fill3D(kf.id, look);
   // Firmas de esta vista, para reconocer el objeto si se pierde
   const feats = computeFeatures(kf.img, 400);
   const X = new Float32Array(3 * feats.n).fill(NaN);
@@ -458,8 +508,8 @@ function onDepth(kf, dm) {
     const P = look(feats.kp[2 * i], feats.kp[2 * i + 1]);
     if (P) { X[3 * i] = P[0]; X[3 * i + 1] = P[1]; X[3 * i + 2] = P[2]; }
   }
-  model.addKeyframe(kf.id, kf.R, kf.t, feats, X, thumbnail(kf.img));
-  refreshCloud(true);
+  M.addKeyframe(kf.id, kf.R, kf.t, feats, X, thumbnail(kf.img));
+  if (active) refreshCloud(true);
 }
 
 /* ---------- Dónde está el objeto ---------- */
@@ -468,8 +518,8 @@ function onDepth(kf, dm) {
 // encuadrado ocupa la parte central de la imagen). Si las vistas son casi paralelas (de frente), se usa la
 // profundidad del centro de la primera imagen.
 let roiObject = false;
-function updateObject(kf, look) {
-  const views = kfList.filter(k => k.hasDepth);
+function updateObject(kf, look, M = model, L = kfList) {
+  const views = L.filter(k => k.hasDepth);
   if (views.length >= 3) {
     const A = new Array(9).fill(0), b = [0, 0, 0], dirs = [];
     for (const k of views) {
@@ -493,69 +543,122 @@ function updateObject(kf, look) {
         const rs = views.filter(k => k.dc > 0).map(k => { const C = camCenter(k.R, k.t); return Math.hypot(C[0] - c[0], C[1] - c[1], C[2] - c[2]) - k.dc; }).filter(r => r > 0);
         const r = rs.length >= 3 ? Math.min(0.6 * D, 1.5 * med(rs)) : 0.45 * D;
         // El centro debe estar delante de las cámaras
-        if (views.every(k => R3z(k, c) > 0)) { model.obj = { c, r }; model.dirty = true; return; }
+        if (views.every(k => R3z(k, c) > 0)) { M.obj = { c, r }; M.dirty = true; return; }
       }
     }
   }
-  if (!model.obj) {
+  if (!M.obj) {
     // De frente: zona central de la primera imagen
     const r = { x: intr.w * 0.35, y: intr.h * 0.35, w: intr.w * 0.3, h: intr.h * 0.3 };
     const P = [];
     for (let y = r.y; y < r.y + r.h; y += 3) for (let x = r.x; x < r.x + r.w; x += 3) { const X = look(x, y); if (X) P.push(X); }
-    model.setObject(P);
+    M.setObject(P);
   }
 }
 
-/* ---------- Objeto perdido: no se suma nada hasta reconocerlo desde cualquier cara ya capturada ---------- */
-function goLost() {
-  state = 'lost';
-  fails = 0;
+/* ---------- Objeto perdido: la captura sigue con un tramo nuevo ---------- */
+function newSegment() {
+  // El tramo actual se guarda (si tiene algo) y se empieza otro al tiro, sin esperar
+  if (model.kfs.length || model.depthMaps) parts.push({ model, kfList, roiObject });
+  model = new Model();
+  kfList = []; lastKf = null; kf0 = null; pose = null; fails = 0;
+  tracker.reset();
+  roiObject = false;
+  state = 'idle';
   relocAt = 0;
-  stat('Buscando el objeto… apunta a una parte ya capturada. Lo capturado se conserva y la captura sigue.');
+  stat('Se perdió el seguimiento: sigo grabando en un tramo nuevo. Se une solo con lo anterior cuando lo reconozca.');
 }
 
-function stepLost(img) {
+// Mientras el tramo nuevo arranca: si la cámara ve una parte ya capturada, se vuelve a ese mismo modelo
+function tryResume(img) {
   const now = performance.now();
   if (now - relocAt < 350) return;
   relocAt = now;
-  if (!model.kfs.length) return;   // las primeras vistas aún se están procesando
   const cur = computeFeatures(img, 400);
   if (cur.n < 20) return;
   const th = thumbnail(img);
-  const scored = model.kfs.map(k => {
-    let s = 0;
-    for (let i = 0; i < th.length; i++) s += th[i] * k.thumb[i];
-    return { k, s };
-  }).sort((a, b) => b.s - a.s);
-  const cands = scored.slice(0, 4).map(o => o.k);
-  for (const k of model.kfs.slice(-2)) if (!cands.includes(k)) cands.push(k);
   let best = null;
-  for (const k of cands) {
-    const m = matchFeatures(cur.desc, cur.n, k.desc, k.n, 64, 0.8);
-    if (m.length < 15) continue;
-    const X = m.map(([, j]) => [k.X[3 * j], k.X[3 * j + 1], k.X[3 * j + 2]]);
-    const uv = m.map(([i]) => [cur.kp[2 * i], cur.kp[2 * i + 1]]);
-    const uvk = m.map(([, j]) => [k.kp[2 * j], k.kp[2 * j + 1]]);
-    const r = pnpRelocalize(X, uv, uvk, k, intr.f, intr.cx, intr.cy, pose ? [pose] : []);
-    if (r && r.inl.length >= Math.max(15, 0.3 * m.length) && (!best || r.inl.length > best.r.inl.length)) best = { r, k, X, uv };
+  for (const P of parts.slice().reverse()) {
+    const M = P.model;
+    if (!M.kfs.length) continue;
+    const scored = M.kfs.map(k => {
+      let s = 0;
+      for (let i = 0; i < th.length; i++) s += th[i] * k.thumb[i];
+      return { k, s };
+    }).sort((a, b) => b.s - a.s);
+    const cands = scored.slice(0, 3).map(o => o.k);
+    for (const k of M.kfs.slice(-2)) if (!cands.includes(k)) cands.push(k);
+    for (const k of cands) {
+      const m = matchFeatures(cur.desc, cur.n, k.desc, k.n, 64, 0.8);
+      if (m.length < 15) continue;
+      const X = m.map(([, j]) => [k.X[3 * j], k.X[3 * j + 1], k.X[3 * j + 2]]);
+      const uv = m.map(([i]) => [cur.kp[2 * i], cur.kp[2 * i + 1]]);
+      const uvk = m.map(([, j]) => [k.kp[2 * j], k.kp[2 * j + 1]]);
+      const r = pnpRelocalize(X, uv, uvk, k, intr.f, intr.cx, intr.cy, []);
+      if (r && r.inl.length >= Math.max(15, 0.3 * m.length) && (!best || r.inl.length > best.r.inl.length)) best = { r, k, X, uv, P };
+    }
+    if (best) break;
   }
   if (!best) return;
-  // Reconocido: se retoma desde aquí con los puntos que calzaron
+  // Reconocido: se vuelve a ese tramo (el tramo nuevo aún no tenía nada)
+  parts.splice(parts.indexOf(best.P), 1);
+  model = best.P.model; kfList = best.P.kfList; roiObject = best.P.roiObject;
   pose = { R: best.r.R, t: best.r.t };
   tracker.setPoints(best.r.inl.map(i => ({ x: best.uv[i][0], y: best.uv[i][1], X: best.X[i] })), img);
   for (const p of tracker.pts) { p.oR = pose.R.slice(); p.ot = pose.t.slice(); p.ver = true; }
   addCornersFromModel(-1);
-  // Vista guardada más cercana con imagen: con ella se calculará la profundidad de las próximas vistas
   const C = camCenter(pose.R, pose.t);
   let bd = Infinity;
+  lastKf = null;
   for (const k of kfList) {
     if (!k.img) continue;
     const Ck = camCenter(k.R, k.t), d = Math.hypot(C[0] - Ck[0], C[1] - Ck[1], C[2] - Ck[2]);
     if (d < bd) { bd = d; lastKf = k; }
   }
+  if (!lastKf) lastKf = { id: ++kfSeq, img: null, R: pose.R.slice(), t: pose.t.slice(), sc: 1 };
   state = 'track';
   fails = 0;
-  stat('Objeto reconocido: sigue girando, se suma al mismo modelo.');
+  stat('Reconocí lo ya capturado: sigo sumando al mismo modelo.');
+  refreshCloud(true);
+}
+
+// Tramo activo ya con vistas: se busca una zona en común con un tramo anterior (firmas de puntos con 3D) y,
+// si la hay, todo el tramo activo se lleva al espacio del anterior y se suman en un solo modelo
+function tryLink() {
+  const now = performance.now();
+  if (model.kfs.length < 2 || model.kfs.length === linkKfs || now - linkAt < 1500) return;
+  linkAt = now;
+  linkKfs = model.kfs.length;
+  for (const P of parts.slice().reverse()) {
+    if (!P.model.kfs.length) continue;
+    const T = alignModels(P.model, model);
+    if (!T) continue;
+    linkInto(P, T);
+    stat('Tramo unido al modelo (' + T.inl + ' puntos en común). Sigo sumando.');
+    refreshCloud(true);
+    return;
+  }
+}
+
+function linkInto(P, T) {
+  const old = model;
+  P.model.absorb(old, T);
+  for (const k of kfList) {
+    const q = movePose(k.R, k.t, T);
+    k.R = q.R; k.t = q.t; k.sc = (k.sc || 1) * T.s;
+    if (k.dc) k.dc *= T.s;
+  }
+  if (pose) pose = movePose(pose.R, pose.t, T);
+  for (const p of tracker.pts) {
+    if (p.X) p.X = simApply(T, p.X);
+    if (p.oR) { const q = movePose(p.oR, p.ot, T); p.oR = q.R; p.ot = q.t; }
+  }
+  model = P.model;
+  kfList = P.kfList.concat(kfList);
+  roiObject = roiObject || P.roiObject;
+  parts.splice(parts.indexOf(P), 1);
+  // Lo que se esté calculando para el tramo viejo va ahora al modelo unido
+  for (const j of jobs.concat(curJob ? [curJob] : [])) if (j.mdl === old) { j.mdl = model; j.list = kfList; }
 }
 
 /* ---------- Modelo en el visor ---------- */
@@ -563,16 +666,24 @@ function refreshCloud(force) {
   const now = performance.now();
   if (!force && now - cloudAt < 500) return;
   cloudAt = now;
-  const c = model.cloud(cleanBg);
+  const c = shownModel().cloud(cleanBg);
   if (c) { cloud = c; viewer.setCloud(cloud); }
   updateProgress();
+}
+
+// En el visor: el tramo activo, salvo que un tramo anterior tenga claramente más
+function shownModel() {
+  let m = model, n = model.countVisible(false);
+  for (const P of parts) { const k = P.model.countVisible(false); if (k > 2 * n) { m = P.model; n = k; } }
+  return m;
 }
 
 function updateProgress() {
   const pct = Math.round(100 * (assist.viewCov || 0));
   $('progBar').style.width = (state === 'track' ? pct : 0) + '%';
   $('progTxt').textContent = 'Modelo: ' + model.countVisible(cleanBg).toLocaleString('es-CL') + ' puntos · ' + model.kfs.length + ' vistas' +
-    (state === 'track' ? ' · esta vista modelada: ' + pct + ' %' : state === 'lost' ? ' · buscando el objeto' : '');
+    (parts.length ? ' · ' + (parts.length + 1) + ' tramos' : '') +
+    (state === 'track' ? ' · esta vista modelada: ' + pct + ' %' : running && state !== 'track' ? ' · arrancando tramo' : '');
 }
 setInterval(() => { if (running) updateProgress(); }, 700);
 
@@ -586,31 +697,68 @@ async function finish() {
   setMarking(false);
   assist.done();
   cam.stop();
+  rec.stop(intr);
   stat('Terminando: procesando las últimas vistas…');
   // Se esperan las vistas que aún se están procesando (hasta 6 s)
   const t0 = performance.now();
   while ((jobBusy || jobs.length) && performance.now() - t0 < 6000) await new Promise(r => setTimeout(r, 100));
+  // Tramos: se intenta unir todo en el teléfono (el mayor recibe a los demás)
+  let all = [model, ...parts.map(P => P.model)].filter(m => m.countVisible(false) >= 50);
+  all.sort((a, b) => b.countVisible(false) - a.countVisible(false));
+  if (all.length > 1) {
+    stat('Terminando: uniendo ' + all.length + ' tramos…');
+    await new Promise(r => setTimeout(r, 30));
+    let changed = true;
+    while (changed && all.length > 1) {
+      changed = false;
+      for (let i = 1; i < all.length; i++) {
+        const T = alignModels(all[0], all[i], { max: 2500 });
+        if (T) { all[0].absorb(all[i], T); all.splice(i, 1); changed = true; break; }
+      }
+    }
+  }
+  model = all[0] || model;
+  parts = all.slice(1).map(m => ({ model: m, kfList: [], roiObject: false }));
   state = 'done';
   $('bNew').disabled = false;
+  refreshCloud(true);
+  model.cloud(cleanBg, 60000, true);
   refreshCloud(true);
   showTab('res');
   octx.clearRect(0, 0, ov.width, ov.height);
   if (kf0 && kf0.img) octx.putImageData(kf0.img, 0, 0);
   const n = model.countVisible(cleanBg);
   if (n < 50) { stat('Captura terminada sin datos suficientes. Pulsa «Nueva captura» y muévete más lento, con buena luz.'); return; }
-  stat('Captura terminada: ' + n.toLocaleString('es-CL') + ' puntos desde ' + model.kfs.length + ' vistas. Guardando la toma…');
-  // La toma se guarda en el teléfono y se sube al servidor
-  const fecha = new Date();
-  const T = model.toToma({
-    id: 'toma-' + fecha.getTime().toString(36) + '-' + Math.random().toString(36).slice(2, 6),
-    nombre: 'Toma ' + fecha.toLocaleString('es-CL', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }),
+  // Cada tramo que quedó sin unir se guarda como parte; el servidor las une después, solo
+  const fecha = new Date(), base = 'toma-' + fecha.getTime().toString(36) + '-' + Math.random().toString(36).slice(2, 6);
+  const nombre = 'Toma ' + fecha.toLocaleString('es-CL', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+  const tomas = all.map((m, i) => m.toToma({
+    id: all.length > 1 ? base + '-p' + (i + 1) : base,
+    nombre: all.length > 1 ? nombre + ' · parte ' + (i + 1) + ' de ' + all.length : nombre,
     fecha: fecha.toISOString(), intr
-  });
-  lastToma = T;
-  let msg = 'Captura terminada: ' + n.toLocaleString('es-CL') + ' puntos desde ' + model.kfs.length + ' vistas.';
-  try { await localTomas.save(T); msg += ' Toma guardada en el teléfono'; } catch (e) { msg += ' No se pudo guardar en el teléfono (' + e.message + ')'; }
+  }));
+  lastToma = tomas[0];
+  let msg = 'Captura terminada: ' + n.toLocaleString('es-CL') + ' puntos desde ' + model.kfs.length + ' vistas' + (all.length > 1 ? ' (quedaron ' + all.length + ' partes sin unir en el teléfono)' : '') + '.';
+  stat(msg + ' Guardando…');
+  try { for (const T of tomas) await localTomas.save(T); msg += ' Guardada en el teléfono'; } catch (e) { msg += ' No se pudo guardar en el teléfono (' + e.message + ')'; }
   stat(msg + '; subiendo al servidor…');
-  try { await api().upload(T); msg += ' y en el servidor.'; } catch (e) { msg += '; no se pudo subir al servidor (' + e.message + '). Se puede subir después desde «Tomas».'; }
+  try {
+    for (const T of tomas) await api().upload(T);
+    msg += ' y en el servidor.';
+    if (tomas.length > 1) {
+      stat(msg + ' Uniendo las partes en el servidor…');
+      const res = await api().merge(tomas.map(T => T.id));
+      const U = res.toma;
+      await localTomas.save(U).catch(() => {});
+      const unidas = res.detalle.filter(d => d.unida).length;
+      if (unidas > 1) {
+        const m = Model.fromToma(U), c = m.cloud(cleanBg, 60000, true);
+        if (c) { cloud = c; viewer.setCloud(cloud); viewer.frontView(); }
+        lastToma = U;
+      }
+      msg += ' Servidor: ' + res.informe;
+    }
+  } catch (e) { msg += '; no se pudo subir al servidor (' + e.message + '). Se puede subir después desde «Tomas».'; }
   stat(msg);
   resNote.textContent = msg;
   if (tab === 'tomas') renderTomas();
@@ -907,7 +1055,11 @@ const showTab = (() => {
   resBox.prepend(resNote);
   const rRow = document.createElement('div');
   rRow.className = 'row';
-  rRow.append($('bClean'), $('bExp'));
+  const bRec = document.createElement('button');
+  bRec.textContent = 'Bajar grabación de prueba';
+  bRec.onclick = async () => { bRec.disabled = true; bRec.textContent = 'Preparando…'; try { await rec.download(); } finally { bRec.disabled = false; bRec.textContent = 'Bajar grabación de prueba'; } };
+  setInterval(() => { bRec.hidden = rec.on || !rec.frames.length; }, 1000);
+  rRow.append($('bClean'), $('bExp'), bRec);
   $('help').before(rRow);
   const wLbl = $('ws').parentElement;
   const wRow = document.createElement('div');
