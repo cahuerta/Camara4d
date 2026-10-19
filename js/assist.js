@@ -2,12 +2,26 @@
 // Solo lee el estado (imagen, seguimiento, modelo acumulado) y dibuja ayudas; no cambia la captura.
 // Crea sus propios elementos dentro de la caja del video y del contenedor de controles (index.html no cambia).
 
-export const VERSION = '1';
+export const VERSION = '2';
 
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
 export class Assist {
   constructor({ vidBox, controls }) {
+    // Foto guía: la última vista buena, semitransparente sobre el video, para volver a calzar la imagen
+    this.ghost = document.createElement('canvas');
+    this.ghost.className = 'as-ghost';
+    this.ghost.hidden = true;
+    vidBox.appendChild(this.ghost);
+    this.gctx = this.ghost.getContext('2d');
+    this.ghostImg = null;
+
+    // Flecha grande hacia donde moverse
+    this.arrow = document.createElement('div');
+    this.arrow.className = 'as-arrow';
+    this.arrow.hidden = true;
+    vidBox.appendChild(this.arrow);
+
     // Mapa de cobertura (esquina superior derecha del video)
     this.map = document.createElement('canvas');
     this.map.className = 'as-map';
@@ -42,11 +56,15 @@ export class Assist {
     this.setDetection(0);
     this.map.hidden = true;
     this.hint.hidden = true;
+    this.showArrow(null);
+    this.showGhost(null);
   }
 
   // Al terminar: se deja el mapa final y se oculta la indicación
   done(acc) {
     this.hint.hidden = true;
+    this.showArrow(null);
+    this.showGhost(null);
     if (acc) this.drawMap(acc);
     this.setDetection(0);
   }
@@ -58,6 +76,26 @@ export class Assist {
     this.detVal.textContent = pct + ' %';
   }
 
+  showArrow(side) {
+    const glyph = { izq: '⬅', der: '➡', arr: '⬆', aba: '⬇' }[side];
+    if (!glyph) { this.arrow.hidden = true; this.arrowSide = null; return; }
+    if (side === this.arrowSide) return;
+    this.arrowSide = side;
+    this.arrow.textContent = glyph;
+    this.arrow.className = 'as-arrow ' + side;
+    this.arrow.hidden = false;
+  }
+
+  showGhost(img) {
+    if (!img) { this.ghost.hidden = true; this.ghostImg = null; return; }
+    if (img !== this.ghostImg) {
+      this.ghost.width = img.width; this.ghost.height = img.height;
+      this.gctx.putImageData(img, 0, 0);
+      this.ghostImg = img;
+    }
+    this.ghost.hidden = false;
+  }
+
   showHint(text) {
     if (text === this.lastHint) return;
     this.lastHint = text;
@@ -67,7 +105,7 @@ export class Assist {
 
   /*
    * Se llama en cada cuadro.
-   * st: { img (ImageData), tracker, acc, lost, capturing, roi }
+   * st: { img (ImageData), tracker, acc, lost, capturing, roi, ghost (ImageData de la última vista buena) }
    */
   update(st) {
     const now = performance.now();
@@ -111,29 +149,34 @@ export class Assist {
     // --- Mapa de cobertura (unas 3 veces por segundo) ---
     if (acc && acc.fusions && now - this.lastMap > 330) { this.drawMap(acc); this.lastMap = now; }
 
-    if (!st.capturing) { this.showHint(''); return; }
-    this.showHint(this.decide(st, { bright, sharp, ids, now }));
+    // Seguimiento perdido: se muestra la última vista buena encima del video para calzarla
+    this.showGhost(st.capturing && st.lost ? st.ghost : null);
+
+    if (!st.capturing) { this.showHint(''); this.showArrow(null); return; }
+    const dec = this.decide(st, { bright, sharp, ids, now });
+    this.showHint(dec.text);
+    this.showArrow(dec.arrow || null);
   }
 
-  // Elige la indicación más importante del momento
+  // Elige la indicación más importante del momento: { text, arrow }
   decide(st, m) {
     const { acc, tracker } = st;
-    if (st.lost) return '↩ Vuelve hacia donde estabas';
-    if (m.bright < 45) return '💡 Falta luz';
-    if (m.sharp < 4) return '✋ Borroso: quieto un momento';
-    if (this.speed > 9) return '🐢 Más lento';
-    if (tracker.tracking && m.ids.length < 60) return '🔍 Poca textura: apunta a más detalle';
+    if (st.lost) return { text: '🎯 Calza el video con la foto transparente' };
+    if (m.bright < 45) return { text: '💡 Falta luz' };
+    if (m.sharp < 4) return { text: '✋ Borroso: quieto un momento' };
+    if (this.speed > 9) return { text: '🐢 Más lento' };
+    if (tracker.tracking && m.ids.length < 60) return { text: '🔍 Poca textura: apunta a más detalle' };
 
     const cov = acc ? this.regions(acc) : null;
-    if (cov && acc.fusions >= 1 && cov.objFrac < 0.1) return '⬆ Acércate';
-    if (cov && acc.fusions >= 1 && cov.objFrac > 0.85) return '⬇ Aléjate un poco';
-    if (this.stillSince && m.now - this.stillSince > 1500) return '↔ Muévete de lado';
+    if (cov && acc.fusions >= 1 && cov.objFrac < 0.1) return { text: '⬆ Acércate' };
+    if (cov && acc.fusions >= 1 && cov.objFrac > 0.85) return { text: '⬇ Aléjate un poco' };
+    if (this.stillSince && m.now - this.stillSince > 1500) return { text: '↔ Muévete de lado', arrow: cov && cov.worst ? cov.worst.side : 'der' };
     if (cov && acc.fusions >= 2) {
       const r = cov.worst;
-      if (r && r.missing > 0.3) return r.text;
+      if (r && r.missing > 0.3) return { text: r.text, arrow: r.side };
     }
-    if (acc && acc.fusions) return '✔ Bien, sigue así';
-    return '↔ Muévete despacio de lado';
+    if (acc && acc.fusions) return { text: '✔ Bien, sigue así' };
+    return { text: '↔ Muévete despacio de lado', arrow: 'der' };
   }
 
   // Cobertura por zonas del objeto: qué parte falta más y qué tan grande se ve el objeto
@@ -149,10 +192,10 @@ export class Assist {
     if (!anyZone) return null;
     const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
     const reg = {
-      izq: { tot: 0, miss: 0, text: '← Falta la izquierda: ve a la izquierda' },
-      der: { tot: 0, miss: 0, text: '→ Falta la derecha: ve a la derecha' },
-      arr: { tot: 0, miss: 0, text: '↑ Falta arriba: sube y apunta abajo' },
-      aba: { tot: 0, miss: 0, text: '↓ Falta abajo: baja el teléfono' }
+      izq: { side: 'izq', tot: 0, miss: 0, text: 'Falta la izquierda: ve a la izquierda' },
+      der: { side: 'der', tot: 0, miss: 0, text: 'Falta la derecha: ve a la derecha' },
+      arr: { side: 'arr', tot: 0, miss: 0, text: 'Falta arriba: sube y apunta abajo' },
+      aba: { side: 'aba', tot: 0, miss: 0, text: 'Falta abajo: baja el teléfono' }
     };
     let measured = 0;
     for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
