@@ -13,6 +13,8 @@ import { Tracker, computeFeatures, matchFeatures, thumbnail, VERSION as TRACKER_
 import { reconstructTwoView, pnpRefine, pnpRelocalize, reprojErrors, mul3, tr3, mv3, VERSION as GEOMETRY_VERSION } from './geometry.js';
 import { denseDepth, VERSION as DENSE_VERSION } from './dense.js';
 import { Sensors } from './sensors.js';
+import { Volume, viewerCloud, sizeOf, VERSION as VOL_VERSION } from './volumen.js';
+import { detectMarkers, correspondences, poseFromHomography, reprojError, FocalCal, openPrintable, ZONA, VERSION as HOJA_VERSION } from './hoja.js';
 import { Viewer } from './viewer.js';
 import { exportJSON } from './export.js';
 import { Assist, VERSION as ASSIST_VERSION } from './assist.js';
@@ -81,6 +83,12 @@ let lastMsg = '';
 // Cuando el tramo nuevo reconoce una parte ya capturada, se une solo al modelo anterior. Los que no se alcancen
 // a unir en el teléfono se unen al terminar, o en el servidor.
 let parts = [];                      // tramos anteriores sin unir: { model, kfList, roiObject }
+
+// MODO HOJA: la hoja impresa da la posición exacta de la cámara y las medidas reales (metros)
+let sheetMode = true;
+try { sheetMode = localStorage.getItem('camara4d_modo') !== 'libre'; } catch (e) { /* nada */ }
+let sheetCal = null, sheetDets = [], sheetSeen = 0;
+let vol = null, volPts = null, volAt = 0;   // capas: forma → relieve → color
 let linkAt = 0, linkKfs = 0, curJob = null;
 const simApply = (T, p) => { const q = mv3(T.R, p); return [T.s * q[0] + T.t[0], T.s * q[1] + T.t[1], T.s * q[2] + T.t[2]]; };
 
@@ -93,7 +101,7 @@ const med = a => { if (!a.length) return 0; const q = a.slice().sort((x, y) => x
 
 /* ---------- Versión y textos de la página ---------- */
 // index.html es fijo: la versión, los textos y los controles nuevos los pone este archivo.
-const APP_VERSION = '15';
+const APP_VERSION = '16';
 const showErr = m => (window.showAppError ? window.showAppError(m) : stat(m));
 $('title').innerHTML = 'Cámara 4D <span>v' + APP_VERSION + '</span>';
 $('help').textContent = 'El modelo 3D se arma con la profundidad de cada píxel y crece con cada vista. Un dedo gira, el pellizco (o la rueda del mouse) acerca y aleja. ' +
@@ -104,8 +112,10 @@ stat('Pulsa «Iniciar cámara» y gira alrededor del objeto. Todo se suma a un s
   if (TRACKER_VERSION !== '6') bad.push('js/tracker.js');
   if (GEOMETRY_VERSION !== '6') bad.push('js/geometry.js');
   if (DENSE_VERSION !== '8') bad.push('js/dense.js');
-  if (ASSIST_VERSION !== '3') bad.push('js/assist.js');
-  if (MODEL_VERSION !== '3') bad.push('js/fragments.js');
+  if (ASSIST_VERSION !== '4') bad.push('js/assist.js');
+  if (MODEL_VERSION !== '4') bad.push('js/fragments.js');
+  if (HOJA_VERSION !== '1') bad.push('js/hoja.js');
+  if (VOL_VERSION !== '1') bad.push('js/volumen.js');
   if (bad.length) showErr('Archivos de otra versión: ' + bad.join(', ') + '. Súbelos de nuevo.');
 }
 
@@ -186,6 +196,7 @@ async function startCamera() {
     model = new Model();
     parts = [];
     rec.start();
+    startSheet();
     resetCapture();
     viewer.setCloud([]);
     updateProgress();
@@ -243,6 +254,17 @@ function step() {
   const img = cam.ctx.getImageData(0, 0, cam.width, cam.height);
   frameNo++;
   rec.frame(frameNo);
+  if (sheetMode) {
+    stepSheet(img);
+    if (state === 'track' && pose && performance.now() - viewAt > 300) {
+      viewProj = model.project(pose.R, pose.t, intr.f, intr.cx, intr.cy, intr.w, intr.h, 4);
+      viewAt = performance.now();
+    }
+    if (running) assist.update({ img, pts: [], state: state === 'track' ? 'track' : 'init', view: state === 'track' ? viewProj : null,
+      det: Math.min(1, sheetDets.length / 10), msg: sheetMsg });
+    drawOverlay();
+    return;
+  }
   if (state === 'idle') startInit(img);
   else if (state === 'init') stepInit(img);
   else if (state === 'track') stepTrack(img);
@@ -256,6 +278,106 @@ function step() {
   }
   if (running) assist.update({ img, pts: tracker.pts, state: state === 'idle' ? 'init' : state, view: state === 'track' ? viewProj : null });
   drawOverlay();
+}
+
+/* ---------- MODO HOJA ---------- */
+let sheetMsg = '';
+function startSheet() {
+  sheetDets = []; sheetSeen = 0; sheetMsg = ''; intr = null;
+  sheetCal = new FocalCal(Math.max(cam.width, cam.height));
+  // Focal ya medida con la hoja en este teléfono: no hace falta volver a calibrar
+  try {
+    const fov = parseFloat(localStorage.getItem('camara4d_fov_hoja'));
+    if (fov >= 35 && fov <= 110) { sheetCal.done = true; sheetCal.fov = fov; }
+  } catch (e) { /* nada */ }
+  vol = null; volPts = null; volAt = 0;
+  if (sheetMode) {
+    model.hoja = { x0: ZONA.x0 / 1000, x1: ZONA.x1 / 1000, y0: ZONA.y0 / 1000, y1: ZONA.y1 / 1000 };
+    model.obj = { c: [0, 0, 0.05], r: 0.2 };
+    vol = new Volume(model.hoja, 0.002, 0.16);
+  }
+}
+
+const refineSheet = (X, uv, f, cx, cy, R, t) => pnpRefine(X, uv, f, cx, cy, R, t, { iters: 8, sigma: 1.5, thr: 3 });
+
+function stepSheet(img) {
+  sheetDets = detectMarkers(img);
+  const { X, uv } = correspondences(sheetDets);
+  if (!intr) {
+    const fov = sheetCal.done ? sheetCal.fov : parseFloat($('fov').value);
+    intr = { f: cam.focalPx(fov), cx: cam.width / 2, cy: cam.height / 2, w: cam.width, h: cam.height, fov };
+  }
+  if (X.length < 8) {
+    sheetMsg = sheetDets.length ? '📄 Se ve poco de la hoja: aléjate un poco para que entren más cuadros negros' : '📄 Apunta a la hoja (con el objeto al centro)';
+    stat(sheetSeen ? 'No veo la hoja: apúntala de nuevo. Lo capturado se conserva.' : 'Apunta a la hoja impresa con el objeto encima. ¿No la tienes? «Imprimir hoja».');
+    if (state === 'track') state = 'init';
+    return;
+  }
+  sheetSeen++;
+  // Focal: se mide con la hoja la primera vez (necesita vistas inclinadas)
+  if (!sheetCal.done) {
+    if (frameNo % 3 === 0) sheetCal.add(X, uv, intr.cx, intr.cy, refineSheet);
+    if (!sheetCal.done) {
+      sheetMsg = '📐 Calibrando la cámara: muévete alrededor e inclina el teléfono (' + Math.min(8, sheetCal.frames.length) + '/8)';
+      stat('Calibrando la cámara con la hoja: muévete despacio alrededor e inclina el teléfono.');
+      return;
+    }
+    try { localStorage.setItem('camara4d_fov_hoja', String(sheetCal.fov)); } catch (e) { /* nada */ }
+    intr = { f: cam.focalPx(sheetCal.fov), cx: cam.width / 2, cy: cam.height / 2, w: cam.width, h: cam.height, fov: sheetCal.fov };
+    $('fov').value = Math.round(sheetCal.fov); $('fovV').textContent = Math.round(sheetCal.fov);
+  }
+  // Posición de la cámara
+  let p0 = pose && state === 'track' ? pose : poseFromHomography(X, uv, intr.f, intr.cx, intr.cy);
+  if (!p0) return;
+  let p = refineSheet(X, uv, intr.f, intr.cx, intr.cy, p0.R, p0.t);
+  let err = reprojError(X, uv, intr.f, intr.cx, intr.cy, p.R, p.t);
+  if (err > 2.5 && p0 === pose) {
+    const ph = poseFromHomography(X, uv, intr.f, intr.cx, intr.cy);
+    if (ph) { p = refineSheet(X, uv, intr.f, intr.cx, intr.cy, ph.R, ph.t); err = reprojError(X, uv, intr.f, intr.cx, intr.cy, p.R, p.t); }
+  }
+  if (err > 2.5) { sheetMsg = '✋ Imagen movida: más despacio'; return; }
+  pose = { R: p.R, t: p.t };
+  state = 'track';
+  sheetMsg = '';
+  // Vistas guardadas: al moverse o girar lo suficiente
+  if (!lastKf) { createKf(img); return; }
+  if (jobs.length + (jobBusy ? 1 : 0) <= 1) {
+    const C = camCenter(pose.R, pose.t), Ck = camCenter(lastKf.R, lastKf.t);
+    const depth = Math.hypot(C[0], C[1], C[2]) || 0.3;
+    const base = Math.hypot(C[0] - Ck[0], C[1] - Ck[1], C[2] - Ck[2]) / depth;
+    const Rd = mul3(pose.R, tr3(lastKf.R));
+    const rot = Math.acos(Math.max(-1, Math.min(1, (Rd[0] + Rd[4] + Rd[8] - 1) / 2)));
+    if (base >= KF_BASE || rot >= KF_ROT) createKf(img);
+  }
+  if (frameNo % 4 === 0) poses.push({ t: Math.round(performance.now()), R: pose.R, tvec: pose.t, marcadores: sheetDets.length });
+  if (poses.length > 3000) poses.shift();
+  if (frameNo % 20 === 0) stat('Capturando con la hoja: gira alrededor del objeto, a distintas alturas. Medidas reales en milímetros.');
+}
+
+// Imagen a la mitad de resolución (para el color, se guarda de todas las vistas)
+function halfImage(img) {
+  const W = img.width, H = img.height, w = W >> 1, h = H >> 1, s = img.data, d = new Uint8ClampedArray(w * h * 4);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const o = (y * w + x) * 4, a = (2 * y * W + 2 * x) * 4;
+    for (let c = 0; c < 3; c++) d[o + c] = (s[a + c] + s[a + 4 + c] + s[a + 4 * W + c] + s[a + 4 * W + 4 + c]) >> 2;
+    d[o + 3] = 255;
+  }
+  return { width: w, height: h, data: d };
+}
+
+// Capas en el visor: durante la captura la forma (bosquejo, sin color); al terminar, con color
+function showVolume(colored) {
+  if (!vol || vol.views < 3) return false;
+  if (colored) {
+    const surf = vol.surface();
+    for (const k of kfList) if (k.small) vol.paint(k.small, k.R, k.t, intr.f / 2, intr.cx / 2, intr.cy / 2, surf, 1);
+  }
+  volPts = vol.points();
+  const c = viewerCloud(volPts, vol.vox, colored);
+  if (!c) return false;
+  cloud = c;
+  viewer.setCloud(cloud);
+  return true;
 }
 
 /* ---------- Comienzo: las dos primeras vistas fijan el espacio y la escala del modelo ---------- */
@@ -404,6 +526,11 @@ function stampOrigin() {
 
 function createKf(img) {
   const kf = { id: ++kfSeq, img, R: pose.R.slice(), t: pose.t.slice(), sc: 1 };
+  if (sheetMode && vol) {
+    // CAPA 1 · forma: cada vista talla el bloque (lo que deja ver la hoja está vacío)
+    vol.carve(img, kf.R, kf.t, intr.f, intr.cx, intr.cy);
+    kf.small = halfImage(img);   // para pintar al final (capa 3)
+  }
   let pair = lastKf && lastKf.img ? lastKf : null;
   if (!pair) {
     const C = camCenter(kf.R, kf.t);
@@ -417,8 +544,7 @@ function createKf(img) {
   kfList.push(kf);
   lastKf = kf;
   if (pair) queueDense(kf, pair);
-  tracker.addCorners(kf.id, null);
-  stampOrigin();
+  if (!sheetMode) { tracker.addCorners(kf.id, null); stampOrigin(); }
   // Memoria: solo se conservan las imágenes de las últimas vistas (las firmas se conservan todas)
   const withImg = kfList.filter(k => k.img);
   for (let i = 0; i < withImg.length - MAX_KF_IMAGES; i++) if (withImg[i] !== pair) withImg[i].img = null;
@@ -429,9 +555,13 @@ function queueDense(refKf, otherKf) {
   const Rr = mul3(otherKf.R, tr3(refKf.R));
   const tr = mv3(Rr, refKf.t).map((v, k) => otherKf.t[k] - v);
   const zs = [];
-  for (const p of tracker.pts) if (p.X) zs.push(R3z(refKf, p.X));
+  if (sheetMode) {
+    // Con la hoja se sabe dónde está todo: desde lo más alto del objeto (hasta 20 cm) hasta la hoja
+    for (const x of [ZONA.x0, 0, ZONA.x1]) for (const y of [ZONA.y0, 0, ZONA.y1]) for (const z of [0, 0.2]) zs.push(R3z(refKf, [x / 1000, y / 1000, z]));
+  } else for (const p of tracker.pts) if (p.X) zs.push(R3z(refKf, p.X));
   const valid = zs.filter(z => z > 0).sort((a, b) => a - b);
-  const range = valid.length >= 10 ? [valid[Math.floor(valid.length * 0.05)], valid[Math.floor(valid.length * 0.95)]] : [0.6, 1.6];
+  const range = sheetMode ? [Math.max(0.03, 0.9 * valid[0]), 1.08 * valid[valid.length - 1]]
+    : valid.length >= 10 ? [valid[Math.floor(valid.length * 0.05)], valid[Math.floor(valid.length * 0.95)]] : [0.6, 1.6];
   jobs.push({ cap: capNo, ref: refKf, other: otherKf, R: Rr, t: tr, range, sc0: refKf.sc, mdl: model, list: kfList });
   pump();
 }
@@ -473,6 +603,8 @@ function onDepth(kf, dm, M = model, L = kfList) {
     if (ds.length > 30) M.voxel = med(ds) * 2.5 / dm.f;
   }
   M.fuseDepth(dm, kf.R, kf.t, kf.id);
+  // CAPA 2 · relieve: la profundidad medida vacía lo que está claramente delante de la superficie
+  if (sheetMode && vol && M === model) vol.relief(dm, kf.R, kf.t);
   kf.hasDepth = true;
   const F = FACTOR, f = intr.f, cx = intr.cx, cy = intr.cy;
   // Posición 3D de un píxel de esta vista según su mapa de profundidad
@@ -498,9 +630,9 @@ function onDepth(kf, dm, M = model, L = kfList) {
     kf.dc = ds.length > 5 ? med(ds) : 0;
   }
   // Esfera del objeto (para limpiar el fondo)
-  if (!(active && roiObject)) updateObject(kf, look, M, L);
+  if (!M.hoja && !(active && roiObject)) updateObject(kf, look, M, L);
   // Los puntos que nacieron en esta vista reciben su posición 3D
-  if (active) tracker.fill3D(kf.id, look);
+  if (active && !sheetMode) tracker.fill3D(kf.id, look);
   // Firmas de esta vista, para reconocer el objeto si se pierde
   const feats = computeFeatures(kf.img, 400);
   const X = new Float32Array(3 * feats.n).fill(NaN);
@@ -666,6 +798,11 @@ function refreshCloud(force) {
   const now = performance.now();
   if (!force && now - cloudAt < 500) return;
   cloudAt = now;
+  if (sheetMode && vol && cleanBg) {
+    if (now - volAt > 1500 || (force && state === 'done')) { volAt = now; showVolume(state === 'done'); }
+    updateProgress();
+    return;
+  }
   const c = shownModel().cloud(cleanBg);
   if (c) { cloud = c; viewer.setCloud(cloud); }
   updateProgress();
@@ -727,7 +864,8 @@ async function finish() {
   showTab('res');
   octx.clearRect(0, 0, ov.width, ov.height);
   if (kf0 && kf0.img) octx.putImageData(kf0.img, 0, 0);
-  const n = model.countVisible(cleanBg);
+  const usaCapas = sheetMode && vol && volPts && volPts.length >= 50;
+  const n = usaCapas ? volPts.length : model.countVisible(cleanBg);
   if (n < 50) { stat('Captura terminada sin datos suficientes. Pulsa «Nueva captura» y muévete más lento, con buena luz.'); return; }
   // Cada tramo que quedó sin unir se guarda como parte; el servidor las une después, solo
   const fecha = new Date(), base = 'toma-' + fecha.getTime().toString(36) + '-' + Math.random().toString(36).slice(2, 6);
@@ -735,10 +873,11 @@ async function finish() {
   const tomas = all.map((m, i) => m.toToma({
     id: all.length > 1 ? base + '-p' + (i + 1) : base,
     nombre: all.length > 1 ? nombre + ' · parte ' + (i + 1) + ' de ' + all.length : nombre,
-    fecha: fecha.toISOString(), intr
-  }));
+    fecha: fecha.toISOString(), intr, voxel: usaCapas && i === 0 ? vol.vox : undefined
+  }, usaCapas && i === 0 ? volPts : null));
   lastToma = tomas[0];
   let msg = 'Captura terminada: ' + n.toLocaleString('es-CL') + ' puntos desde ' + model.kfs.length + ' vistas' + (all.length > 1 ? ' (quedaron ' + all.length + ' partes sin unir en el teléfono)' : '') + '.';
+  if (usaCapas) { const sz = sizeOf(volPts); msg = 'Objeto listo (forma + relieve + color): ' + n.toLocaleString('es-CL') + ' cubitos de 2 mm desde ' + vol.views + ' vistas. Medidas: ' + sz.join(' × ') + ' mm (ancho × fondo × alto).'; }
   stat(msg + ' Guardando…');
   try { for (const T of tomas) await localTomas.save(T); msg += ' Guardada en el teléfono'; } catch (e) { msg += ' No se pudo guardar en el teléfono (' + e.message + ')'; }
   stat(msg + '; subiendo al servidor…');
@@ -1035,6 +1174,17 @@ function drawOverlay() {
     octx.setLineDash([]);
   }
   if (marking || state === 'lost') return;
+  if (sheetMode) {
+    octx.lineWidth = 2;
+    octx.strokeStyle = state === 'track' ? '#3ddc84' : '#f7c948';
+    for (const d of sheetDets) {
+      octx.beginPath();
+      d.corners.forEach((c, i) => (i ? octx.lineTo(c[0], c[1]) : octx.moveTo(c[0], c[1])));
+      octx.closePath();
+      octx.stroke();
+    }
+    return;
+  }
   for (const p of tracker.pts) {
     octx.fillStyle = p.X ? '#4cc9f0' : '#3ddc84';
     octx.beginPath();
@@ -1128,6 +1278,23 @@ const showTab = (() => {
   $('bEnd').classList.add('big', 'stop');
   $('bNew').classList.add('big');
   $('bRoi').parentElement.classList.add('cap-sec');
+  const bMode = document.createElement('button'), bPrint = document.createElement('button');
+  bPrint.textContent = '🖨 Imprimir hoja';
+  bPrint.onclick = () => { if (!openPrintable()) alert('El navegador bloqueó la ventana: permite ventanas emergentes para imprimir la hoja.'); };
+  const paintMode = () => {
+    bMode.textContent = sheetMode ? '📄 Con hoja (medidas reales)' : '🔓 Sin hoja';
+    bMode.classList.toggle('on', sheetMode);
+    $('bRoi').hidden = $('bRoiClr').hidden = sheetMode;
+    bPrint.hidden = !sheetMode;
+  };
+  bMode.onclick = () => {
+    if (running) { alert('Cambia el modo antes de iniciar la captura (o pulsa «Terminar»).'); return; }
+    sheetMode = !sheetMode;
+    try { localStorage.setItem('camara4d_modo', sheetMode ? 'hoja' : 'libre'); } catch (e) { /* nada */ }
+    paintMode();
+  };
+  $('bRoi').parentElement.prepend(bMode, bPrint);
+  paintMode();
   $('fov').parentElement.parentElement.classList.add('cap-adv');
 
   // Pantalla Resultado

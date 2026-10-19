@@ -2,7 +2,7 @@
 // Solo lee el estado y dibuja ayudas; no cambia la captura.
 // Crea sus propios elementos dentro de la caja del video y del contenedor de controles (index.html no cambia).
 
-export const VERSION = '3';
+export const VERSION = '4';
 
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
@@ -117,7 +117,7 @@ export class Assist {
 
     // --- Barra de detección: puntos seguidos y textura ---
     const ptsQ = clamp(pts.length / 200, 0, 1), texQ = clamp((sharp - 4) / 16, 0, 1);
-    this.setDetection(st.state === 'lost' ? 0 : Math.sqrt(ptsQ * texQ));
+    this.setDetection(st.state === 'lost' ? 0 : st.det !== undefined ? st.det : Math.sqrt(ptsQ * texQ));
 
     // --- Mapa de lo ya modelado en esta vista (unas 3 veces por segundo) ---
     let cov = null;
@@ -165,12 +165,13 @@ export class Assist {
   }
 
   decide(st, m) {
+    if (st.msg) return { text: st.msg };
     if (st.state === 'lost') return { text: '🔎 Buscando el objeto: apunta a una parte ya capturada' };
     if (m.bright < 45) return { text: '💡 Falta luz' };
     if (m.sharp < 4) return { text: '✋ Borroso: quieto un momento' };
     if (this.speed > 9) return { text: '🐢 Más lento' };
     if (st.state === 'init') return { text: '↔ Muévete despacio de lado para empezar', arrow: 'der' };
-    if (st.pts.length < 60) return { text: '🔍 Poca textura: apunta a más detalle' };
+    if (st.det === undefined && st.pts.length < 60) return { text: '🔍 Poca textura: apunta a más detalle' };
     const c = m.cov;
     if (c && c.objFrac > 0 && c.objFrac < 0.06) return { text: '⬆ Acércate' };
     if (this.stillSince && m.now - this.stillSince > 1500) return { text: '↻ Sigue girando alrededor del objeto', arrow: 'der' };

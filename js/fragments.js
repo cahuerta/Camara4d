@@ -5,7 +5,7 @@
 //  · Vistas guardadas: firmas de puntos con su posición 3D, para reconocer el objeto desde cualquier cara.
 //  · Toma: el modelo + sus vistas, empaquetado para guardar en el teléfono y subir al servidor, que une tomas.
 
-export const VERSION = '3';
+export const VERSION = '4';
 
 const OFF = 32768, SH = 65536;
 const keyOf = (ix, iy, iz) => ((ix + OFF) * SH + (iy + OFF)) * SH + (iz + OFF);
@@ -97,6 +97,46 @@ function cleanCloud(base, obj, vox) {
   const big = Math.max(0, ...sizes);
   const out = [];
   for (const c of cells.values()) if (sizes[c.comp] >= 0.25 * big) for (const i of c.pts) out.push(base[i]);
+  return out;
+}
+
+// Modo hoja: el objeto es lo que está sobre la zona libre de la hoja (unos mm por encima del papel)
+function cleanSheet(base, z, vox) {
+  const m = 0.004, keep = [];
+  for (const v of base) {
+    const x = v.x / v.n, y = v.y / v.n, h = v.z / v.n;
+    if (h > Math.max(0.0025, 1.5 * vox) && h < 0.3 && x > z.x0 - m && x < z.x1 + m && y > z.y0 - m && y < z.y1 + m) keep.push(v);
+  }
+  return keep.length ? largestBlocks(keep, vox) : keep;
+}
+
+// Se queda el bloque conectado mayor (y los que tengan al menos 1/4 de su tamaño)
+function largestBlocks(vs, vox) {
+  const cell = 2 * vox, cells = new Map();
+  for (const v of vs) {
+    const ix = Math.floor(v.x / v.n / cell), iy = Math.floor(v.y / v.n / cell), iz = Math.floor(v.z / v.n / cell), k = keyOf(ix, iy, iz);
+    let a = cells.get(k);
+    if (!a) cells.set(k, a = { vs: [], comp: -1, ix, iy, iz });
+    a.vs.push(v);
+  }
+  const sizes = [];
+  for (const c of cells.values()) {
+    if (c.comp >= 0) continue;
+    const id = sizes.length, stack = [c];
+    let size = 0;
+    c.comp = id;
+    while (stack.length) {
+      const q = stack.pop();
+      size += q.vs.length;
+      for (let a = -1; a <= 1; a++) for (let b = -1; b <= 1; b++) for (let e = -1; e <= 1; e++) {
+        const nb = cells.get(keyOf(q.ix + a, q.iy + b, q.iz + e));
+        if (nb && nb.comp < 0) { nb.comp = id; stack.push(nb); }
+      }
+    }
+    sizes.push(size);
+  }
+  const big = Math.max(0, ...sizes), out = [];
+  for (const c of cells.values()) if (sizes[c.comp] >= 0.25 * big) out.push(...c.vs);
   return out;
 }
 
@@ -222,6 +262,7 @@ export class Model {
     this.voxel = 0.006;        // tamaño del cubito (la escala del modelo: profundidad típica ≈ 1)
     this.obj = null;           // esfera del objeto { c, r } para limpiar el fondo
     this.depthMaps = 0;
+    this.hoja = null;          // modo hoja: zona libre de la hoja (m); el objeto es lo que está sobre ella
     this.maps = [];            // mapas de profundidad guardados (para descartar lo que otra vista ve a través)
     this.dirty = true;
   }
@@ -298,7 +339,7 @@ export class Model {
     const key = this.vox.size + ':' + this.depthMaps + ':' + (this.obj ? this.obj.c.join(',') + ',' + this.obj.r : '-');
     const now = Date.now();
     if (this._clean && (this._clean.key === key || (!force && now - this._clean.at < 1500))) return this._clean.out;
-    const out = cleanCloud(base, this.obj, this.voxel);
+    const out = this.hoja ? cleanSheet(base, this.hoja, this.voxel) : cleanCloud(base, this.obj, this.voxel);
     this._clean = { key, at: now, out };
     return out;
   }
@@ -314,11 +355,13 @@ export class Model {
       P.push([v.x / v.n, v.y / v.n, v.z / v.n, v.r / v.n, v.g / v.n, v.b / v.n]);
     }
     const med = a => { const q = a.slice().sort((x, y) => x - y); return q[q.length >> 1]; };
-    const c = this.obj && clean ? this.obj.c : [med(P.map(p => p[0])), med(P.map(p => p[1])), med(P.map(p => p[2]))];
+    const c = this.obj && clean && !this.hoja ? this.obj.c : [med(P.map(p => p[0])), med(P.map(p => p[1])), med(P.map(p => p[2]))];
     const sc = med(P.map(p => Math.hypot(p[0] - c[0], p[1] - c[1], p[2] - c[2]))) || 1;
     const size = this.voxel * 1.6 / sc;
     return P.map(p => {
       const L = (0.299 * p[3] + 0.587 * p[4] + 0.114 * p[5]) / 255;
+      // Con la hoja, Z (hacia arriba de la hoja) va hacia arriba en pantalla
+      if (this.hoja) return [(p[0] - c[0]) / sc, (p[2] - c[2]) / sc, -(p[1] - c[1]) / sc, (L - 0.5) * 2, p[3], p[4], p[5], size];
       return [(p[0] - c[0]) / sc, -(p[1] - c[1]) / sc, -(p[2] - c[2]) / sc, (L - 0.5) * 2, p[3], p[4], p[5], size];
     });
   }
@@ -408,8 +451,20 @@ export class Model {
 
   /* ---------- Toma: empaquetar y desempaquetar ---------- */
 
-  toToma(meta) {
-    const all = [...this.vox.values()].filter(v => v.v >= 1 && !(v.m > v.v));
+  toToma(meta, puntos = null) {
+    // Con la hoja se guarda solo el objeto (así otra toma, con el objeto en otra posición, se une por el objeto).
+    // puntos: [[x, y, z, r, g, b], …] para guardar otra superficie (las capas forma/relieve/color)
+    const all = puntos ? puntos.map(p => ({ x: p[0], y: p[1], z: p[2], r: p[3], g: p[4], b: p[5], n: 1, v: 3 }))
+      : this.hoja ? this._visible(true, true) : [...this.vox.values()].filter(v => v.v >= 1 && !(v.m > v.v));
+    const z = this.hoja, onObj = (x, y, h) => !z || (h > 0.003 && x > z.x0 && x < z.x1 && y > z.y0 && y < z.y1);
+    const kfs = this.kfs.map(k => {
+      if (!z) return k;
+      const keep = [];
+      for (let i = 0; i < k.n; i++) if (onObj(k.X[3 * i], k.X[3 * i + 1], k.X[3 * i + 2])) keep.push(i);
+      const kp = new Float32Array(2 * keep.length), desc = new Uint32Array(8 * keep.length), X = new Float32Array(3 * keep.length);
+      keep.forEach((i, j) => { kp.set(k.kp.subarray(2 * i, 2 * i + 2), 2 * j); desc.set(k.desc.subarray(8 * i, 8 * i + 8), 8 * j); X.set(k.X.subarray(3 * i, 3 * i + 3), 3 * j); });
+      return { ...k, n: keep.length, kp, desc, X };
+    }).filter(k => k.n > 0);
     const n = all.length, xyz = new Float32Array(3 * n), rgb = new Uint8Array(3 * n), vistas = new Uint8Array(n);
     all.forEach((v, i) => {
       xyz[3 * i] = v.x / v.n; xyz[3 * i + 1] = v.y / v.n; xyz[3 * i + 2] = v.z / v.n;
@@ -419,9 +474,9 @@ export class Model {
     return {
       formato: 'camara4d-toma', version: 1,
       id: meta.id, nombre: meta.nombre, fecha: meta.fecha, origen: meta.origen || 'telefono',
-      voxel: this.voxel, intr: meta.intr, objeto: this.obj, mapas: this.depthMaps,
+      voxel: meta.voxel || this.voxel, intr: meta.intr, objeto: this.obj, mapas: this.depthMaps, hoja: this.hoja || null,
       puntos: { n, xyz: b64(xyz), rgb: b64(rgb), vistas: b64(vistas) },
-      vistas: this.kfs.map(k => ({ R: k.R, t: k.t, n: k.n, kp: b64(k.kp), desc: b64(k.desc), X: b64(k.X) }))
+      vistas: kfs.map(k => ({ R: k.R, t: k.t, n: k.n, kp: b64(k.kp), desc: b64(k.desc), X: b64(k.X) }))
     };
   }
 
@@ -430,6 +485,7 @@ export class Model {
     const m = new Model();
     m.voxel = T.voxel || 0.006;
     m.obj = T.objeto || null;
+    m.hoja = T.hoja || null;
     m.depthMaps = Math.max(3, T.mapas || 3);
     const xyz = new Float32Array(unb64(T.puntos.xyz)), rgb = new Uint8Array(unb64(T.puntos.rgb)), vis = new Uint8Array(unb64(T.puntos.vistas));
     for (let i = 0; i < T.puntos.n; i++) {
