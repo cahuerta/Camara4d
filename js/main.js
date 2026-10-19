@@ -102,7 +102,7 @@ const med = a => { if (!a.length) return 0; const q = a.slice().sort((x, y) => x
 
 /* ---------- Versión y textos de la página ---------- */
 // index.html es fijo: la versión, los textos y los controles nuevos los pone este archivo.
-const APP_VERSION = '18';
+const APP_VERSION = '19';
 const showErr = m => (window.showAppError ? window.showAppError(m) : stat(m));
 $('title').innerHTML = 'Cámara 4D <span>v' + APP_VERSION + '</span>';
 $('help').textContent = 'El modelo 3D se arma con la profundidad de cada píxel y crece con cada vista. Un dedo gira, el pellizco (o la rueda del mouse) acerca y aleja. ' +
@@ -999,7 +999,7 @@ function sesSendView(kf, img, mask, I) {
   sesQueue.push(async () => {
     if (ses !== s) return;
     const r = await api().sesionPost('/sesiones/' + s.codigo + '/vistas', {
-      camara: s.camara, id: kf.id, R: kf.R, t: kf.t, f: I.f, cx: I.cx, cy: I.cy, w: img.width, h: img.height,
+      camara: s.camara, id: capNo + '-' + kf.id, R: kf.R, t: kf.t, f: I.f, cx: I.cx, cy: I.cy, w: img.width, h: img.height,
       jpg: await jpegB64(img), mask: packMask(mask)
     });
     kf.sesVista = r.vista;
