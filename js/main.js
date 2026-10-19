@@ -56,9 +56,9 @@ const med = a => { if (!a.length) return 0; const q = a.slice().sort((x, y) => x
 
 /* ---------- Versión y textos de la página ---------- */
 // index.html es fijo: la versión, los textos y los controles nuevos los pone este archivo.
-const APP_VERSION = '12';
+const APP_VERSION = '13';
 const showErr = m => (window.showAppError ? window.showAppError(m) : stat(m));
-$('title').textContent = 'Cámara de registro · v' + APP_VERSION;
+$('title').innerHTML = 'Cámara 4D <span>v' + APP_VERSION + '</span>';
 $('help').textContent = 'El modelo 3D se arma con la profundidad de cada píxel y crece con cada vista. Un dedo gira, el pellizco (o la rueda del mouse) acerca y aleja. ' +
   'w = intensidad de cada punto (oscuro −1, claro +1); con peso 0 ves el modelo normal.';
 stat('Pulsa «Iniciar cámara» y gira alrededor del objeto. Todo se suma a un solo modelo; si pierdes el objeto, vuelve a apuntarlo y sigue. Solo «Terminar» detiene la captura.');
@@ -382,7 +382,7 @@ function createKf(img) {
   for (let i = 0; i < withImg.length - MAX_KF_IMAGES; i++) if (withImg[i] !== pair) withImg[i].img = null;
 }
 
-  /* ---------- Profundidad de cada vista guardada (en segundo plano) → se suma al modelo ---------- */
+/* ---------- Profundidad de cada vista guardada (en segundo plano) → se suma al modelo ---------- */
 function queueDense(refKf, otherKf) {
   const Rr = mul3(otherKf.R, tr3(refKf.R));
   const tr = mv3(Rr, refKf.t).map((v, k) => otherKf.t[k] - v);
@@ -593,6 +593,7 @@ async function finish() {
   state = 'done';
   $('bNew').disabled = false;
   refreshCloud(true);
+  showTab('res');
   octx.clearRect(0, 0, ov.width, ov.height);
   if (kf0 && kf0.img) octx.putImageData(kf0.img, 0, 0);
   const n = model.countVisible(cleanBg);
@@ -611,7 +612,8 @@ async function finish() {
   stat(msg + '; subiendo al servidor…');
   try { await api().upload(T); msg += ' y en el servidor.'; } catch (e) { msg += '; no se pudo subir al servidor (' + e.message + '). Se puede subir después desde «Tomas».'; }
   stat(msg);
-  if (tomasPanel.open) renderTomas();
+  resNote.textContent = msg;
+  if (tab === 'tomas') renderTomas();
 }
 
 /* ---------- Tomas: ver, subir y unir (servidor) ---------- */
@@ -619,20 +621,17 @@ let lastToma = null;
 const apiBase = () => { try { return localStorage.getItem('camara4d_api') || API_DEFAULT; } catch (e) { return API_DEFAULT; } };
 const api = () => serverApi(apiBase());
 
-const tomasBtn = document.createElement('button');
-tomasBtn.textContent = 'Tomas y unión';
-$('bExp').after(tomasBtn);
 const tomasPanel = document.createElement('div');
 tomasPanel.className = 'tomas';
-tomasPanel.hidden = true;
-$('controls').appendChild(tomasPanel);
-tomasBtn.onclick = () => { tomasPanel.open = !tomasPanel.open; tomasPanel.hidden = !tomasPanel.open; tomasBtn.classList.toggle('on', tomasPanel.open); if (tomasPanel.open) renderTomas(); };
 
 async function renderTomas() {
   tomasPanel.innerHTML = '<div class="tm-head">Cargando tomas…</div>';
   let local = [], server = [], srvErr = '';
   try { local = await localTomas.list(); } catch (e) { /* sin almacenamiento */ }
-  try { server = await api().list(); } catch (e) { srvErr = e.message; }
+  srvLine.textContent = '☁ Servidor: ' + apiBase().replace(/^https?:\/\//, '') + ' · conectando… (si estaba dormido puede tardar hasta 1 minuto)';
+  srvLine.className = 'srv wait';
+  try { server = await api().list(); srvLine.textContent = '☁ Servidor conectado: ' + apiBase().replace(/^https?:\/\//, ''); srvLine.className = 'srv ok'; }
+  catch (e) { srvErr = e.message; srvLine.textContent = '☁ Servidor sin respuesta (' + apiBase().replace(/^https?:\/\//, '') + '): ' + e.message + '. Las tomas siguen guardadas en el teléfono.'; srvLine.className = 'srv bad'; }
   const inServer = new Set(server.map(t => t.id));
   const rows = new Map();
   for (const t of local) rows.set(t.id, { ...t, local: true, server: inServer.has(t.id) });
@@ -641,7 +640,7 @@ async function renderTomas() {
   tomasPanel.innerHTML = '';
   const head = document.createElement('div');
   head.className = 'tm-head';
-  head.textContent = 'Marca 2 o más tomas del mismo objeto (de este u otro teléfono) y pulsa «Unir».' + (srvErr ? ' Servidor no disponible: ' + srvErr : '');
+  head.textContent = 'Marca 2 o más tomas del mismo objeto (de este u otro teléfono) y pulsa «Unir». 📱 = en el teléfono · ☁ = en el servidor.';
   tomasPanel.appendChild(head);
   if (!list.length) { const e = document.createElement('div'); e.className = 'tm-row'; e.textContent = 'Aún no hay tomas.'; tomasPanel.appendChild(e); }
   for (const t of list) {
@@ -655,6 +654,7 @@ async function renderTomas() {
     const btns = r.querySelector('.tm-btns');
     const mk = (txt, fn) => { const b = document.createElement('button'); b.textContent = txt; b.onclick = fn; btns.appendChild(b); };
     mk('Ver', () => showToma(t));
+    if (srvErr && t.local && !t.server) r.classList.add('pend');
     if (t.local && !t.server) mk('Subir', async () => { try { await api().upload(await localTomas.get(t.id)); renderTomas(); } catch (e) { alert('No se pudo subir: ' + e.message); } });
     if (t.local) mk('Borrar', async () => { if (confirm('¿Borrar «' + (t.nombre || t.id) + '» del teléfono?')) { await localTomas.remove(t.id); renderTomas(); } });
     tomasPanel.appendChild(r);
@@ -682,6 +682,7 @@ async function showToma(t) {
     const c = m.cloud(cleanBg);
     if (c) { cloud = c; viewer.setCloud(cloud); viewer.frontView(); }
     lastToma = T;
+    showTab('res');
     stat('Mostrando «' + (T.nombre || T.id) + '»: ' + T.puntos.n.toLocaleString('es-CL') + ' puntos.');
   } catch (e) { stat('No se pudo abrir la toma: ' + e.message); }
 }
@@ -704,6 +705,8 @@ async function mergeSelected(list) {
     if (c) { cloud = c; viewer.setCloud(cloud); viewer.frontView(); }
     lastToma = T;
     stat('Tomas unidas: ' + res.informe);
+    resNote.textContent = 'Unión: ' + res.informe;
+    showTab('res');
     renderTomas();
   } catch (e) { stat('No se pudieron unir: ' + e.message); }
 }
@@ -809,7 +812,7 @@ function drawOverlay() {
   }
 }
 
- /* ---------- Controles ---------- */
+/* ---------- Controles ---------- */
 $('fov').oninput = () => {
   $('fovV').textContent = $('fov').value;
   focal.done = true;   // el usuario eligió la focal a mano
@@ -851,6 +854,92 @@ $('bExp').onclick = () => exportJSON({
   size: { w: cam.width, h: cam.height },
   extra: { toma: lastToma || (model.voxels ? model.toToma({ id: 'sin-guardar', nombre: 'Captura en curso', fecha: new Date().toISOString(), intr }) : null) }
 });
+
+/* ---------- Pantalla tipo app: menú arriba con 3 pantallas ---------- */
+// index.html no cambia: aquí se reordenan sus partes en pestañas.
+//   📷 Captura  → cámara, botón grande Iniciar / Terminar, asistente y avance
+//   🧊 Resultado → el modelo 3D a pantalla completa, sus controles y exportar
+//   ☁ Tomas     → tomas guardadas (teléfono y servidor), subir y unir
+let tab = 'cap';
+const srvLine = document.createElement('div');
+const resNote = document.createElement('div');
+resNote.className = 'res-note';
+const showTab = (() => {
+  const boxes = document.querySelectorAll('body > .box');
+  const capBox = boxes[0], resBox = boxes[1];
+  document.body.classList.add('app');
+
+  // Barra superior: título + menú
+  const top = document.createElement('header');
+  top.className = 'top';
+  const nav = document.createElement('nav');
+  nav.className = 'tabs';
+  const tabs = [['cap', '📷', 'Captura'], ['res', '🧊', 'Resultado'], ['tomas', '☁', 'Tomas']];
+  const btn = {};
+  for (const [id, ic, txt] of tabs) {
+    const b = document.createElement('button');
+    b.innerHTML = '<i>' + ic + '</i><span>' + txt + '</span>';
+    b.onclick = () => show(id);
+    nav.appendChild(b);
+    btn[id] = b;
+  }
+  $('title').before(top);
+  top.append($('title'), nav);
+
+  // Pantalla Captura
+  const pCap = document.createElement('section');
+  pCap.className = 'page';
+  capBox.before(pCap);
+  pCap.appendChild(capBox);
+  const main = $('bStart').parentElement;
+  main.classList.add('cap-main');
+  $('bStart').classList.add('big');
+  $('bEnd').classList.add('big', 'stop');
+  $('bNew').classList.add('big');
+  $('bRoi').parentElement.classList.add('cap-sec');
+  $('fov').parentElement.parentElement.classList.add('cap-adv');
+
+  // Pantalla Resultado
+  const pRes = document.createElement('section');
+  pRes.className = 'page';
+  resBox.before(pRes);
+  pRes.appendChild(resBox);
+  resBox.prepend(resNote);
+  const rRow = document.createElement('div');
+  rRow.className = 'row';
+  rRow.append($('bClean'), $('bExp'));
+  $('help').before(rRow);
+  const wLbl = $('ws').parentElement;
+  const wRow = document.createElement('div');
+  wRow.className = 'row';
+  wRow.appendChild(wLbl);
+  $('help').before(wRow);
+
+  // Pantalla Tomas
+  const pTom = document.createElement('section');
+  pTom.className = 'page';
+  const tBox = document.createElement('div');
+  tBox.className = 'box';
+  srvLine.className = 'srv';
+  tBox.append(srvLine, tomasPanel);
+  pTom.appendChild(tBox);
+  pRes.after(pTom);
+
+  // Lo que quedó en la caja de captura y no se usa ahí (exportar ya está en Resultado)
+  const pages = { cap: pCap, res: pRes, tomas: pTom };
+  function show(id) {
+    tab = id;
+    for (const k in pages) { pages[k].hidden = k !== id; btn[k].classList.toggle('on', k === id); }
+    tomasPanel.open = id === 'tomas';
+    if (id === 'res') requestAnimationFrame(() => viewer.fit());
+    if (id === 'tomas') renderTomas();
+    window.scrollTo(0, 0);
+  }
+  // Marca de «capturando» en el menú
+  setInterval(() => btn.cap.classList.toggle('rec', running), 500);
+  show('cap');
+  return show;
+})();
 
 updateProgress();
 
