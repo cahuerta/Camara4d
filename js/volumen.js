@@ -36,60 +36,112 @@ function toneAt(xmm, ymm) {
    Para cada píxel: 0 = sin información (fuera del papel), 1 = se ve la hoja, 2 = algo la tapa.
    Se compara la textura que debería verse (la hoja impresa, vista desde esa cámara) con la que se ve, en ventanas
    de 7×7 (correlación normalizada: no le afectan la luz ni las sombras suaves). */
-export function sheetMask(img, R, t, f, cx, cy) {
-  const W = img.width, H = img.height, d = img.data, N = W * H;
-  const P = new Float32Array(N), O = new Float32Array(N), info = new Uint8Array(N);
+function maskAt(img, R, t, f, cx, cy, S, blur, r, erode, search = 0) {
+  const W0 = img.width, H0 = img.height, d = img.data, W = Math.floor(W0 / S), H = Math.floor(H0 / S), N = W * H;
+  const P0 = new Float32Array(N), O0 = new Float32Array(N), info = new Uint8Array(N);
   const C = [-(R[0] * t[0] + R[3] * t[1] + R[6] * t[2]), -(R[1] * t[0] + R[4] * t[1] + R[7] * t[2]), -(R[2] * t[0] + R[5] * t[1] + R[8] * t[2])];
   for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
-    const i = y * W + x, a = (x - cx) / f, b = (y - cy) / f;
-    O[i] = 0.299 * d[4 * i] + 0.587 * d[4 * i + 1] + 0.114 * d[4 * i + 2];
-    const dz = R[2] * a + R[5] * b + R[8];
-    if (dz >= -1e-6) continue;
-    const s = -C[2] / dz, X = C[0] + s * (R[0] * a + R[3] * b + R[6]), Y = C[1] + s * (R[1] * a + R[4] * b + R[7]);
-    const tone = toneAt(X * 1000, Y * 1000);
-    if (tone < 0) continue;
-    P[i] = tone;
+    const i = y * W + x;
+    let o = 0;
+    for (let b = 0; b < S; b++) for (let a = 0; a < S; a++) { const q = 4 * ((y * S + b) * W0 + x * S + a); o += 0.299 * d[q] + 0.587 * d[q + 1] + 0.114 * d[q + 2]; }
+    O0[i] = o / (S * S);
+    let p = 0, ok = true;
+    for (let b = 0; b < S && ok; b++) for (let a = 0; a < S; a++) {
+      const u = (x * S + a + 0.5 - 0.5 - cx) / f, v = (y * S + b + 0.5 - 0.5 - cy) / f;
+      const dz = R[2] * u + R[5] * v + R[8];
+      if (dz >= -1e-6) { ok = false; break; }
+      const s = -C[2] / dz, X = C[0] + s * (R[0] * u + R[3] * v + R[6]), Y = C[1] + s * (R[1] * u + R[4] * v + R[7]);
+      const tone = toneAt(X * 1000, Y * 1000);
+      if (tone < 0) { ok = false; break; }
+      p += tone;
+    }
+    if (!ok) continue;
+    P0[i] = p / (S * S);
     info[i] = 1;
   }
-  // Imágenes integrales para medias, varianzas y covarianza en ventanas
-  const W1 = W + 1, sP = new Float64Array(W1 * (H + 1)), sO = new Float64Array(W1 * (H + 1)), sPP = new Float64Array(W1 * (H + 1)), sOO = new Float64Array(W1 * (H + 1)), sPO = new Float64Array(W1 * (H + 1)), sI = new Float64Array(W1 * (H + 1));
-  for (let y = 0; y < H; y++) {
-    let a = 0, b = 0, c = 0, e = 0, g = 0, k = 0;
-    for (let x = 0; x < W; x++) {
-      const i = y * W + x, p = P[i], o = O[i], m = info[i];
-      a += p * m; b += o * m; c += p * p * m; e += o * o * m; g += p * o * m; k += m;
-      const q = (y + 1) * W1 + x + 1, u = y * W1 + x + 1;
-      sP[q] = sP[u] + a; sO[q] = sO[u] + b; sPP[q] = sPP[u] + c; sOO[q] = sOO[u] + e; sPO[q] = sPO[u] + g; sI[q] = sI[u] + k;
-    }
-  }
-  const box = (S, x0, y0, x1, y1) => S[y1 * W1 + x1] - S[y0 * W1 + x1] - S[y1 * W1 + x0] + S[y0 * W1 + x0];
-  const mask = new Uint8Array(N), r = 3, rg = 12, full = (2 * r + 1) * (2 * r + 1);
-  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+  // Suavizado 3×3 de ambas (solo con píxeles con información)
+  const P = blur ? new Float32Array(N) : P0, O = blur ? new Float32Array(N) : O0;
+  if (blur) for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
     const i = y * W + x;
     if (!info[i]) continue;
-    const x0 = Math.max(0, x - r), x1 = Math.min(W, x + r + 1), y0 = Math.max(0, y - r), y1 = Math.min(H, y + r + 1);
-    const n = box(sI, x0, y0, x1, y1);
-    if (n < full) continue;   // ventana incompleta (borde del papel): sin información
-    const mp = box(sP, x0, y0, x1, y1) / n, mo = box(sO, x0, y0, x1, y1) / n;
-    const vp = box(sPP, x0, y0, x1, y1) / n - mp * mp, vo = box(sOO, x0, y0, x1, y1) / n - mo * mo, cpo = box(sPO, x0, y0, x1, y1) / n - mp * mo;
-    if (vp > 0.004) {
-      // Con textura: correlación (no le afectan la luz ni las sombras suaves)
+    let sp = 0, so = 0, n = 0;
+    for (let b = -1; b <= 1; b++) for (let a = -1; a <= 1; a++) {
+      const xx = x + a, yy = y + b;
+      if (xx < 0 || yy < 0 || xx >= W || yy >= H) continue;
+      const j = yy * W + xx;
+      if (!info[j]) continue;
+      sp += P0[j]; so += O0[j]; n++;
+    }
+    P[i] = sp / n; O[i] = so / n;
+  }
+  // Correlación en ventanas con imágenes integrales. Con «search» se prueba además la hoja desplazada unos
+  // píxeles y se queda la mejor: tolera papel no del todo plano y pequeños errores de posición.
+  const W1 = W + 1, M = W1 * (H + 1);
+  const sO = new Float64Array(M), sOO = new Float64Array(M);
+  for (let y = 0; y < H; y++) {
+    let b = 0, e = 0;
+    for (let x = 0; x < W; x++) { const o = O[y * W + x]; b += o; e += o * o; const q = (y + 1) * W1 + x + 1, u = y * W1 + x + 1; sO[q] = sO[u] + b; sOO[q] = sOO[u] + e; }
+  }
+  const box = (Sx, x0, y0, x1, y1) => Sx[y1 * W1 + x1] - Sx[y0 * W1 + x1] - Sx[y1 * W1 + x0] + Sx[y0 * W1 + x0];
+  const best = new Float32Array(N).fill(-2), tex = new Uint8Array(N), full = (2 * r + 1) * (2 * r + 1);
+  const sP = new Float64Array(M), sPP = new Float64Array(M), sPO = new Float64Array(M), sI = new Float64Array(M);
+  for (let dy = -search; dy <= search; dy++) for (let dx = -search; dx <= search; dx++) {
+    for (let y = 0; y < H; y++) {
+      let a = 0, c = 0, g = 0, k = 0;
+      const ys = y + dy;
+      for (let x = 0; x < W; x++) {
+        const xs = x + dx;
+        if (ys >= 0 && ys < H && xs >= 0 && xs < W) {
+          const j = ys * W + xs;
+          if (info[j] && info[y * W + x]) { const p = P[j]; a += p; c += p * p; g += p * O[y * W + x]; k++; }
+        }
+        const q = (y + 1) * W1 + x + 1, u = y * W1 + x + 1;
+        sP[q] = sP[u] + a; sPP[q] = sPP[u] + c; sPO[q] = sPO[u] + g; sI[q] = sI[u] + k;
+      }
+    }
+    for (let y = r; y < H - r; y++) for (let x = r; x < W - r; x++) {
+      const i = y * W + x;
+      if (!info[i]) continue;
+      const x0 = x - r, x1 = x + r + 1, y0 = y - r, y1 = y + r + 1;
+      if (box(sI, x0, y0, x1, y1) < full) continue;   // ventana incompleta (borde del papel)
+      const n = full, mp = box(sP, x0, y0, x1, y1) / n, mo = box(sO, x0, y0, x1, y1) / n;
+      const vp = box(sPP, x0, y0, x1, y1) / n - mp * mp;
+      if (vp <= 0.003) continue;   // papel liso: no se decide (una cara lisa del objeto se vería igual)
+      const vo = box(sOO, x0, y0, x1, y1) / n - mo * mo, cpo = box(sPO, x0, y0, x1, y1) / n - mp * mo;
       const ncc = cpo / Math.sqrt(vp * Math.max(vo, 1e-6));
-      mask[i] = ncc > 0.55 ? 1 : 2;
-    } else {
-      // Papel liso: el tono debe calzar con la relación tono impreso → tono visto de los alrededores
-      const X0 = Math.max(0, x - rg), X1 = Math.min(W, x + rg + 1), Y0 = Math.max(0, y - rg), Y1 = Math.min(H, y + rg + 1);
-      const nn = box(sI, X0, Y0, X1, Y1);
-      if (nn < 100) continue;
-      const MP = box(sP, X0, Y0, X1, Y1) / nn, MO = box(sO, X0, Y0, X1, Y1) / nn;
-      const VP = box(sPP, X0, Y0, X1, Y1) / nn - MP * MP, CPO = box(sPO, X0, Y0, X1, Y1) / nn - MP * MO;
-      let pred;
-      if (VP > 0.01) { const g = CPO / VP; pred = MO + g * (P[i] - MP); }
-      else pred = MO / Math.max(0.05, MP) * P[i];
-      mask[i] = Math.abs(mo - pred) < 0.12 * Math.abs(pred) + 10 && vo < 80 ? 1 : 2;
+      tex[i] = 1;
+      if (ncc > best[i]) best[i] = ncc;
     }
   }
+  const half = new Uint8Array(N);
+  for (let i = 0; i < N; i++) if (tex[i]) half[i] = best[i] > 0.5 ? 1 : 2;
+  // Prudencia en los bordes del objeto: «se ve la hoja» solo si los vecinos también la ven (la ventana de
+  // comparación mezcla papel y objeto en el borde y podría tallar un poco del objeto)
+  const er = new Uint8Array(half);
+  for (let y = erode; y < H - erode; y++) for (let x = erode; x < W - erode; x++) {
+    const i = y * W + x;
+    if (half[i] !== 1) continue;
+    let ok = true;
+    for (let b = -erode; b <= erode && ok; b++) for (let a = -erode; a <= erode; a++) if (half[i + b * W + a] === 2) { ok = false; break; }
+    if (!ok) er[i] = 0;
+  }
+  half.set(er);
+  // De vuelta a resolución completa
+  const mask = new Uint8Array(W0 * H0);
+  for (let y = 0; y < H0; y++) { const yy = Math.min(H - 1, Math.floor(y / S)); for (let x = 0; x < W0; x++) mask[y * W0 + x] = half[yy * W + Math.min(W - 1, Math.floor(x / S))]; }
   return mask;
+}
+
+// Dos comparaciones: fina (resolución completa, detalle exacto) y gruesa (media resolución suavizada, tolera que
+// la hoja real no calce perfecto: papel no del todo plano, pequeños errores de posición, foco, impresión).
+// Se ve la hoja si cualquiera de las dos lo asegura; algo la tapa si ninguna la ve.
+export function sheetMask(img, R, t, f, cx, cy) {
+  const fine = maskAt(img, R, t, f, cx, cy, 1, false, 3, 1), coarse = maskAt(img, R, t, f, cx, cy, 2, true, 4, 2, 2);
+  for (let i = 0; i < fine.length; i++) {
+    if (fine[i] === 1 || coarse[i] === 1) fine[i] = 1;
+    else if (fine[i] === 2 || coarse[i] === 2) fine[i] = 2;
+  }
+  return fine;
 }
 
 /* ---------- Volumen tallado ---------- */
@@ -122,7 +174,13 @@ export class Volume {
 
   // 1. FORMA: tallar con una vista
   carve(img, R, t, f, cx, cy) {
-    const mask = sheetMask(img, R, t, f, cx, cy), W = img.width, H = img.height;
+    const mask = sheetMask(img, R, t, f, cx, cy);
+    this.carveMask(mask, img.width, img.height, R, t, f, cx, cy);
+    return mask;
+  }
+
+  // Tallar con una máscara ya calculada (la máscara se calcula en segundo plano, en el worker)
+  carveMask(mask, W, H, R, t, f, cx, cy) {
     const { nx, ny, nz, vox, x0, y0 } = this;
     for (let iz = 0; iz < nz; iz++) {
       const Z = (iz + 0.5) * vox;
@@ -142,7 +200,6 @@ export class Volume {
       }
     }
     this.views++;
-    return mask;
   }
 
   // 2. RELIEVE: un mapa de profundidad (vista R,t; a 1/factor de resolución) vacía lo que está claramente delante
@@ -220,7 +277,7 @@ export class Volume {
     for (const [i, u, v, z] of proj) {
       const k = Math.floor(v / s) * w2 + Math.floor(u / s);
       if (zb[k] < z - 2.5 * this.vox) continue;   // algo más cerca lo tapa
-      const o = 4 * (Math.round(v) * W + Math.round(u)), wgt = 1 / (z * z);
+      const o = 4 * (Math.min(H - 1, Math.round(v)) * W + Math.min(W - 1, Math.round(u))), wgt = 1 / (z * z);
       this.col[4 * i] += d[o] * wgt; this.col[4 * i + 1] += d[o + 1] * wgt; this.col[4 * i + 2] += d[o + 2] * wgt; this.col[4 * i + 3] += wgt;
       const L = 0.299 * d[o] + 0.587 * d[o + 1] + 0.114 * d[o + 2];
       this.lum[3 * i] += L; this.lum[3 * i + 1] += L * L; this.lum[3 * i + 2]++;
@@ -253,7 +310,26 @@ export class Volume {
       }
       for (const [i, c] of add) C.set(i, c);
     }
+    // Grupos sueltos (motas flotando): se deja el bloque mayor y los que tengan al menos 1/6 de su tamaño
+    const inS = new Set(surf.idx), comp = new Map(), sizes = [];
+    for (const i0 of surf.idx) {
+      if (comp.has(i0)) continue;
+      const id = sizes.length, st = [i0];
+      comp.set(i0, id);
+      let n = 0;
+      while (st.length) {
+        const i = st.pop();
+        n++;
+        for (let dz = -2; dz <= 2; dz++) for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
+          const j = i + dx + dy * nx + dz * nxy;
+          if (inS.has(j) && !comp.has(j)) { comp.set(j, id); st.push(j); }
+        }
+      }
+      sizes.push(n);
+    }
+    const big = Math.max(0, ...sizes);
     for (const i of surf.idx) {
+      if (sizes[comp.get(i)] < big / 6) continue;
       const P = this.center(i), c = C.get(i) || [150, 150, 150];
       out.push([P[0], P[1], P[2], c[0], c[1], c[2]]);
     }

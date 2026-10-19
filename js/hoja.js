@@ -399,7 +399,11 @@ export class FocalCal {
     let best = 65, be = Infinity;
     for (let fov = 40; fov <= 100; fov += 2) { const e = err(fov); if (e < be) { be = e; best = fov; } }
     for (let fov = best - 2; fov <= best + 2; fov += 0.25) { const e = err(fov); if (e < be) { be = e; best = fov; } }
-    if (be < 1.5) { this.fov = best; this.done = true; this.err = be; }
+    // Se acepta si calza bien; si la hoja no está del todo plana el error no baja tanto: tras 3 intentos se
+    // acepta el mejor (y se avisa), para no quedar calibrando para siempre
+    this.tries = (this.tries || 0) + 1;
+    if (!this.bestTry || be < this.bestTry.err) this.bestTry = { fov: best, err: be };
+    if (be < 1.5 || this.tries >= 3) { this.fov = this.bestTry.fov; this.err = this.bestTry.err; this.done = true; }
     else this.frames.splice(0, 4);   // sin acuerdo: se renuevan las vistas
   }
 }

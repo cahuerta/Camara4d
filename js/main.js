@@ -13,7 +13,7 @@ import { Tracker, computeFeatures, matchFeatures, thumbnail, VERSION as TRACKER_
 import { reconstructTwoView, pnpRefine, pnpRelocalize, reprojErrors, mul3, tr3, mv3, VERSION as GEOMETRY_VERSION } from './geometry.js';
 import { denseDepth, VERSION as DENSE_VERSION } from './dense.js';
 import { Sensors } from './sensors.js';
-import { Volume, viewerCloud, sizeOf, VERSION as VOL_VERSION } from './volumen.js';
+import { Volume, viewerCloud, sizeOf, sheetMask, VERSION as VOL_VERSION } from './volumen.js';
 import { detectMarkers, correspondences, poseFromHomography, reprojError, FocalCal, openPrintable, ZONA, VERSION as HOJA_VERSION } from './hoja.js';
 import { Viewer } from './viewer.js';
 import { exportJSON } from './export.js';
@@ -89,6 +89,7 @@ let sheetMode = true;
 try { sheetMode = localStorage.getItem('camara4d_modo') !== 'libre'; } catch (e) { /* nada */ }
 let sheetCal = null, sheetDets = [], sheetSeen = 0;
 let vol = null, volPts = null, volAt = 0;   // capas: forma → relieve → color
+let sectors = new Set();                    // lados ya vistos alrededor de la hoja (12 de 30°)
 let linkAt = 0, linkKfs = 0, curJob = null;
 const simApply = (T, p) => { const q = mv3(T.R, p); return [T.s * q[0] + T.t[0], T.s * q[1] + T.t[1], T.s * q[2] + T.t[2]]; };
 
@@ -149,6 +150,28 @@ function runJob(msg, transfer, cb) {
     try { cb({ dm: denseDepth(msg.ref, msg.cur, msg.R, msg.t, msg.f, msg.cx, msg.cy, msg.range, msg.opts) }); }
     catch (e) { cb({ error: e.message }); }
   } else cb({ errs: null });
+}
+
+/* ---------- Segundo proceso en segundo plano: máscaras de la hoja (capa forma) ---------- */
+// Va aparte del de profundidad para que ninguno espere al otro
+let volWorker = null, volSeq = 0, volBusy = 0;
+const volPending = new Map();
+try {
+  volWorker = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
+  volWorker.onmessage = e => { const cb = volPending.get(e.data.id); if (cb) { volPending.delete(e.data.id); cb(e.data); } };
+  volWorker.onerror = () => { volWorker = null; for (const cb of volPending.values()) cb({ error: 'proceso detenido' }); volPending.clear(); };
+} catch (e) { volWorker = null; }
+
+// Tallar el volumen con una vista: la máscara se calcula en segundo plano y el tallado al recibirla
+function carveView(kf) {
+  const v = vol, cap = capNo, I = intr, img = kf.img;
+  const done = mask => { if (vol === v && capNo === cap && mask) { v.carveMask(mask, img.width, img.height, kf.R, kf.t, I.f, I.cx, I.cy); kf.carved = true; } };
+  if (!volWorker) { done(sheetMask(img, kf.R, kf.t, I.f, I.cx, I.cy)); return; }
+  const copy = { data: new Uint8ClampedArray(img.data), width: img.width, height: img.height };
+  const id = ++volSeq;
+  volBusy++;
+  volPending.set(id, r => { volBusy--; done(r.mask || null); });
+  volWorker.postMessage({ type: 'mask', id, img: copy, R: kf.R, t: kf.t, f: I.f, cx: I.cx, cy: I.cy }, [copy.data.buffer]);
 }
 
 /* ---------- Focal automática ---------- */
@@ -290,7 +313,7 @@ function startSheet() {
     const fov = parseFloat(localStorage.getItem('camara4d_fov_hoja'));
     if (fov >= 35 && fov <= 110) { sheetCal.done = true; sheetCal.fov = fov; }
   } catch (e) { /* nada */ }
-  vol = null; volPts = null; volAt = 0;
+  vol = null; volPts = null; volAt = 0; sectors = new Set();
   if (sheetMode) {
     model.hoja = { x0: ZONA.x0 / 1000, x1: ZONA.x1 / 1000, y0: ZONA.y0 / 1000, y1: ZONA.y1 / 1000 };
     model.obj = { c: [0, 0, 0.05], r: 0.2 };
@@ -322,7 +345,9 @@ function stepSheet(img) {
       stat('Calibrando la cámara con la hoja: muévete despacio alrededor e inclina el teléfono.');
       return;
     }
-    try { localStorage.setItem('camara4d_fov_hoja', String(sheetCal.fov)); } catch (e) { /* nada */ }
+    // Solo se guarda para las próximas veces si calzó bien (hoja plana)
+    if (sheetCal.err < 2) try { localStorage.setItem('camara4d_fov_hoja', String(sheetCal.fov)); } catch (e) { /* nada */ }
+    if (sheetCal.err >= 2) showNote('Aviso: la hoja no parece estar plana (error ' + sheetCal.err.toFixed(1) + ' px). Ponla sobre una mesa o un cartón para mejor resultado.');
     intr = { f: cam.focalPx(sheetCal.fov), cx: cam.width / 2, cy: cam.height / 2, w: cam.width, h: cam.height, fov: sheetCal.fov };
     $('fov').value = Math.round(sheetCal.fov); $('fovV').textContent = Math.round(sheetCal.fov);
   }
@@ -331,17 +356,24 @@ function stepSheet(img) {
   if (!p0) return;
   let p = refineSheet(X, uv, intr.f, intr.cx, intr.cy, p0.R, p0.t);
   let err = reprojError(X, uv, intr.f, intr.cx, intr.cy, p.R, p.t);
-  if (err > 2.5 && p0 === pose) {
+  // Error aceptable: más holgado si la hoja no está del todo plana (según la calibración)
+  const maxErr = Math.max(3, 2 * (sheetCal.err || 1.5));
+  if (err > maxErr && p0 === pose) {
     const ph = poseFromHomography(X, uv, intr.f, intr.cx, intr.cy);
     if (ph) { p = refineSheet(X, uv, intr.f, intr.cx, intr.cy, ph.R, ph.t); err = reprojError(X, uv, intr.f, intr.cx, intr.cy, p.R, p.t); }
   }
-  if (err > 2.5) { sheetMsg = '✋ Imagen movida: más despacio'; return; }
+  if (err > maxErr) { sheetMsg = '✋ Imagen movida: más despacio'; return; }
   pose = { R: p.R, t: p.t };
   state = 'track';
   sheetMsg = '';
+  // Guía: hay que dar la vuelta completa (o girar la hoja con el objeto encima)
+  if (sectors.size < 12 && vol && vol.views >= 2) {
+    const C = camCenter(pose.R, pose.t), cur = Math.floor(((Math.atan2(C[1], C[0]) * 180 / Math.PI) + 360) % 360 / 30);
+    sheetMsg = '↻ Vuelta: ' + sectors.size + ' de 12 lados. ' + (sectors.has(cur) ? 'Sigue girando alrededor (o gira la hoja con el objeto encima)' : 'Bien: lado nuevo');
+  }
   // Vistas guardadas: al moverse o girar lo suficiente
   if (!lastKf) { createKf(img); return; }
-  if (jobs.length + (jobBusy ? 1 : 0) <= 1) {
+  if (jobs.length + (jobBusy ? 1 : 0) <= 1 && volBusy <= 1) {
     const C = camCenter(pose.R, pose.t), Ck = camCenter(lastKf.R, lastKf.t);
     const depth = Math.hypot(C[0], C[1], C[2]) || 0.3;
     const base = Math.hypot(C[0] - Ck[0], C[1] - Ck[1], C[2] - Ck[2]) / depth;
@@ -528,8 +560,10 @@ function createKf(img) {
   const kf = { id: ++kfSeq, img, R: pose.R.slice(), t: pose.t.slice(), sc: 1 };
   if (sheetMode && vol) {
     // CAPA 1 · forma: cada vista talla el bloque (lo que deja ver la hoja está vacío)
-    vol.carve(img, kf.R, kf.t, intr.f, intr.cx, intr.cy);
+    carveView(kf);
     kf.small = halfImage(img);   // para pintar al final (capa 3)
+    const C = camCenter(kf.R, kf.t);
+    sectors.add(Math.floor(((Math.atan2(C[1], C[0]) * 180 / Math.PI) + 360) % 360 / 30));
   }
   let pair = lastKf && lastKf.img ? lastKf : null;
   if (!pair) {
@@ -799,7 +833,7 @@ function refreshCloud(force) {
   if (!force && now - cloudAt < 500) return;
   cloudAt = now;
   if (sheetMode && vol && cleanBg) {
-    if (now - volAt > 1500 || (force && state === 'done')) { volAt = now; showVolume(state === 'done'); }
+    if (now - volAt > 3000 || (force && state === 'done')) { volAt = now; showVolume(state === 'done'); }
     updateProgress();
     return;
   }
@@ -816,6 +850,12 @@ function shownModel() {
 }
 
 function updateProgress() {
+  if (sheetMode) {
+    const pct = Math.round(100 * sectors.size / 12);
+    $('progBar').style.width = pct + '%';
+    $('progTxt').textContent = 'Vuelta alrededor: ' + sectors.size + ' de 12 lados · ' + (vol ? vol.views : 0) + ' vistas talladas' + (sheetCal && sheetCal.done ? ' · cámara calibrada ' + Math.round(sheetCal.fov) + '°' : '');
+    return;
+  }
   const pct = Math.round(100 * (assist.viewCov || 0));
   $('progBar').style.width = (state === 'track' ? pct : 0) + '%';
   $('progTxt').textContent = 'Modelo: ' + model.countVisible(cleanBg).toLocaleString('es-CL') + ' puntos · ' + model.kfs.length + ' vistas' +
@@ -838,7 +878,7 @@ async function finish() {
   stat('Terminando: procesando las últimas vistas…');
   // Se esperan las vistas que aún se están procesando (hasta 6 s)
   const t0 = performance.now();
-  while ((jobBusy || jobs.length) && performance.now() - t0 < 6000) await new Promise(r => setTimeout(r, 100));
+  while ((jobBusy || jobs.length || volBusy) && performance.now() - t0 < 8000) await new Promise(r => setTimeout(r, 100));
   // Tramos: se intenta unir todo en el teléfono (el mayor recibe a los demás)
   let all = [model, ...parts.map(P => P.model)].filter(m => m.countVisible(false) >= 50);
   all.sort((a, b) => b.countVisible(false) - a.countVisible(false));
