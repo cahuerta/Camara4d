@@ -67,10 +67,9 @@ export class Viewer {
       this._ptr.set(e.pointerId, { x: e.clientX, y: e.clientY });
       if (this._ptr.size === 1) {
         if (this.mode === '3d') {
-          // El modelo es una cara del objeto: se limita el giro a ±70° para que nunca quede de canto
-          const lim = 1.22;
-          this.ang.xz = Math.max(-lim, Math.min(lim, this.ang.xz + dx));
-          this.ang.yz = Math.max(-lim, Math.min(lim, this.ang.yz + dy));
+          // Giro libre: el modelo puede tener todas las caras del objeto
+          this.ang.xz += dx;
+          this.ang.yz += dy;
         }
         else { this.ang.xw += dx; this.ang.yw += dy; }
       } else if (this._ptr.size === 2) {
@@ -156,4 +155,4 @@ export class Viewer {
     }
     requestAnimationFrame(t => this._render(t));
   }
-                 }
+}
