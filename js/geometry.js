@@ -2,7 +2,7 @@
 // Estima la pose relativa entre la referencia y el fotograma actual (matriz esencial, 8 puntos + RANSAC)
 // y triangula los puntos. Convención: X2 = R·X1 + t, con t de norma 1 (escala relativa).
 
-export const VERSION = '5';
+export const VERSION = '6';
 
 export const mul3 = (A, B) => {
   const C = new Array(9).fill(0);
@@ -394,5 +394,147 @@ export function normalizeCloud(pts, colors) {
   return out.length >= 15 ? out : null;
                         }
 
+/* ---------- Posición de la cámara respecto del modelo (PnP) ---------- */
+// Convención: p_cam = R·X + t (X en coordenadas del modelo). Proyección u = f·x/z + cx, v = f·y/z + cy.
+
+// Error de proyección (px) de cada punto para una pose
+export function reprojErrors(X, uv, f, cx, cy, R, t) {
+  const e = new Float64Array(X.length);
+  for (let i = 0; i < X.length; i++) {
+    const P = X[i];
+    const x = R[0] * P[0] + R[1] * P[1] + R[2] * P[2] + t[0];
+    const y = R[3] * P[0] + R[4] * P[1] + R[5] * P[2] + t[1];
+    const z = R[6] * P[0] + R[7] * P[1] + R[8] * P[2] + t[2];
+    e[i] = z > 1e-6 ? Math.hypot(f * x / z + cx - uv[i][0], f * y / z + cy - uv[i][1]) : 1e6;
+  }
+  return e;
+}
+
+// Afinamiento de la pose (Levenberg-Marquardt con pérdida robusta de Cauchy) partiendo de (R0, t0).
+// Devuelve { R, t, inl (índices con error < thr px), err (error mediano de los inliers) }.
+export function pnpRefine(X, uv, f, cx, cy, R0, t0, { iters = 12, sigma = 2.5, thr = 4 } = {}) {
+  let R = R0.slice(), t = t0.slice();
+  const n = X.length, s2 = sigma * sigma;
+  const robustCost = (R, t) => {
+    let c = 0;
+    for (let i = 0; i < n; i++) {
+      const P = X[i];
+      const z = R[6] * P[0] + R[7] * P[1] + R[8] * P[2] + t[2];
+      if (z <= 1e-6) { c += 50; continue; }
+      const ru = f * (R[0] * P[0] + R[1] * P[1] + R[2] * P[2] + t[0]) / z + cx - uv[i][0];
+      const rv = f * (R[3] * P[0] + R[4] * P[1] + R[5] * P[2] + t[1]) / z + cy - uv[i][1];
+      c += Math.log1p((ru * ru + rv * rv) / s2);
+    }
+    return c;
+  };
+  let cost = robustCost(R, t), lambda = 1e-3;
+  const H = new Float64Array(36), g = new Float64Array(6), Ju = new Float64Array(6), Jv = new Float64Array(6);
+  for (let it = 0; it < iters; it++) {
+    H.fill(0); g.fill(0);
+    for (let i = 0; i < n; i++) {
+      const P = X[i];
+      const px = R[0] * P[0] + R[1] * P[1] + R[2] * P[2] + t[0];
+      const py = R[3] * P[0] + R[4] * P[1] + R[5] * P[2] + t[1];
+      const pz = R[6] * P[0] + R[7] * P[1] + R[8] * P[2] + t[2];
+      if (pz <= 1e-6) continue;
+      const iz = 1 / pz;
+      const ru = f * px * iz + cx - uv[i][0], rv = f * py * iz + cy - uv[i][1];
+      const w = 1 / (1 + (ru * ru + rv * rv) / s2);
+      // d(u,v)/dp · [ -[p]x | I ]   (perturbación a la izquierda: R ← exp(δw)·R, t ← exp(δw)·t + δt)
+      const a0 = f * iz, a2 = -f * px * iz * iz, b1 = f * iz, b2 = -f * py * iz * iz;
+      Ju[0] = a2 * py; Ju[1] = a0 * pz - a2 * px; Ju[2] = -a0 * py; Ju[3] = a0; Ju[4] = 0; Ju[5] = a2;
+      Jv[0] = -b1 * pz + b2 * py; Jv[1] = -b2 * px; Jv[2] = b1 * px; Jv[3] = 0; Jv[4] = b1; Jv[5] = b2;
+      for (let a = 0; a < 6; a++) {
+        const wa = w * Ju[a], wb = w * Jv[a];
+        g[a] += wa * ru + wb * rv;
+        for (let b = a; b < 6; b++) H[6 * a + b] += wa * Ju[b] + wb * Jv[b];
+      }
+    }
+    for (let a = 0; a < 6; a++) for (let b = 0; b < a; b++) H[6 * a + b] = H[6 * b + a];
+    let improved = false;
+    for (let tries = 0; tries < 8; tries++) {
+      const M = Array.from(H);
+      for (let a = 0; a < 6; a++) M[7 * a] += lambda * (H[7 * a] + 1e-9);
+      const d = solveN(M, Array.from(g, v => -v), 6);
+      if (!d) { lambda *= 10; continue; }
+      const dR = rodrigues([d[0], d[1], d[2]]);
+      const Rn = mul3(dR, R), tn = mv3(dR, t).map((v, k) => v + d[3 + k]);
+      const cn = robustCost(Rn, tn);
+      if (cn < cost) {
+        const rel = (cost - cn) / Math.max(cost, 1e-12);
+        R = Rn; t = tn; cost = cn; lambda = Math.max(1e-9, lambda / 4); improved = true;
+        if (rel < 1e-6) it = iters;
+        break;
+      }
+      lambda *= 10;
+    }
+    if (!improved) break;
+  }
+  const e = reprojErrors(X, uv, f, cx, cy, R, t);
+  const inl = [];
+  for (let i = 0; i < n; i++) if (e[i] < thr) inl.push(i);
+  const ei = inl.map(i => e[i]).sort((a, b) => a - b);
+  return { R, t, inl, err: ei.length ? ei[ei.length >> 1] : Infinity, errors: e };
+}
+
+// Pose sin posición previa (al reconocer el objeto): se prueban varios puntos de partida y se queda la mejor.
+//  X: puntos 3D del modelo · uv: su posición en el cuadro actual · uvKf: su posición en la vista guardada
+//  kf: { R, t } pose de esa vista guardada · extra: poses de partida adicionales (p. ej., la última conocida)
+export function pnpRelocalize(X, uv, uvKf, kf, f, cx, cy, extra = []) {
+  const n = X.length;
+  if (n < 12) return null;
+  const starts = [{ R: kf.R, t: kf.t }, ...extra];
+  // Partida a partir del movimiento entre la vista guardada y el cuadro actual (8 puntos + escala)
+  const X1 = uvKf.map(p => [(p[0] - cx) / f, (p[1] - cy) / f]);
+  const X2 = uv.map(p => [(p[0] - cx) / f, (p[1] - cy) / f]);
+  const rel = estimatePose(X1, X2, f);
+  if (rel) {
+    const ss = [];
+    for (const i of rel.inl) {
+      const P = X[i];
+      const a0 = mv3(kf.R, P).map((v, k) => v + kf.t[k]);   // punto en la cámara de la vista guardada
+      const a = mv3(rel.R, a0), b = rel.t;
+      const xo = X2[i][0], yo = X2[i][1];
+      const dx = b[0] - xo * b[2], dy = b[1] - yo * b[2];
+      if (Math.abs(dx) > 1e-6) ss.push((xo * a[2] - a[0]) / dx);
+      if (Math.abs(dy) > 1e-6) ss.push((yo * a[2] - a[1]) / dy);
+    }
+    if (ss.length >= 6) {
+      const s = median(ss);
+      if (isFinite(s)) {
+        const Rc = mul3(rel.R, kf.R), tc = mv3(rel.R, kf.t).map((v, k) => v + s * rel.t[k]);
+        starts.push({ R: Rc, t: tc });
+      }
+    }
+  }
+  let best = null;
+  const consider = r => { if (!best || r.inl.length > best.inl.length || (r.inl.length === best.inl.length && r.err < best.err)) best = r; };
+  for (const st of starts) consider(pnpRefine(X, uv, f, cx, cy, st.R, st.t, { iters: 25, sigma: 3, thr: 5 }));
+  // Muestreo aleatorio (RANSAC): con muchas coincidencias falsas, se ajusta con grupos chicos al azar
+  // y se queda la pose que explica más puntos
+  if (best.inl.length < 0.6 * n) {
+    for (let it = 0; it < 40; it++) {
+      const idx = new Set();
+      while (idx.size < 6) idx.add((Math.random() * n) | 0);
+      const ii = [...idx];
+      for (const st of starts) {
+        const r0 = pnpRefine(ii.map(i => X[i]), ii.map(i => uv[i]), f, cx, cy, st.R, st.t, { iters: 15, sigma: 3, thr: 5 });
+        if (r0.inl.length < 5) continue;
+        const e = reprojErrors(X, uv, f, cx, cy, r0.R, r0.t), inl = [];
+        for (let i = 0; i < n; i++) if (e[i] < 5) inl.push(i);
+        if (!best || inl.length > best.inl.length) best = { R: r0.R, t: r0.t, inl, err: 0 };
+      }
+      if (best.inl.length >= 0.6 * n) break;
+    }
+  }
+  if (!best || best.inl.length < 12) return null;
+  // Afinamiento final solo con los puntos que calzan
+  const Xi = best.inl.map(i => X[i]), ui = best.inl.map(i => uv[i]);
+  const fin = pnpRefine(Xi, ui, f, cx, cy, best.R, best.t, { iters: 15, sigma: 2, thr: 4 });
+  const e = reprojErrors(X, uv, f, cx, cy, fin.R, fin.t);
+  const inl = [];
+  for (let i = 0; i < n; i++) if (e[i] < 4) inl.push(i);
+  return { R: fin.R, t: fin.t, inl, err: fin.err };
+}
 
     
