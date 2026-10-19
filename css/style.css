@@ -3,9 +3,9 @@
 body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;padding:12px;padding-bottom:40px;max-width:720px;margin-inline:auto}
 h1{font-size:18px;margin:4px 0 10px}
 .box{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px;margin-bottom:10px}
-/* Cámara compacta: el video ocupa como máximo un tercio de la pantalla y se centra */
+/* Cámara: el video ocupa como máximo la mitad de la pantalla y se centra */
 .vid{position:relative;width:fit-content;max-width:100%;margin:0 auto;background:#000;border-radius:10px;overflow:hidden;min-height:80px;min-width:120px}
-.vid video{display:block;max-width:100%;max-height:34vh;width:auto;height:auto}
+.vid video{display:block;max-width:100%;max-height:50vh;width:auto;height:auto}
 .vid canvas{position:absolute;inset:0;width:100%;height:100%;pointer-events:none}
 .vid.marking canvas{pointer-events:auto;touch-action:none;cursor:crosshair}
 .vid.marking{outline:2px dashed var(--ac);outline-offset:-2px}
@@ -31,3 +31,10 @@ small{color:var(--mut);display:block;margin-top:8px}
 .as-det-bar{flex:1;height:8px;background:#1d2330;border:1px solid var(--line);border-radius:6px;overflow:hidden}
 .as-det-fill{height:100%;width:0;background:#ff5d5d;transition:width .2s}
 .as-det-val{min-width:36px;text-align:right}
+.vid canvas.as-ghost{opacity:.45;pointer-events:none}
+.as-arrow{position:absolute;font-size:64px;line-height:1;color:#f7c948;text-shadow:0 0 10px rgba(0,0,0,.8);pointer-events:none;animation:as-pulse 1s ease-in-out infinite}
+.as-arrow.izq{left:8px;top:50%;transform:translateY(-50%)}
+.as-arrow.der{right:8px;top:50%;transform:translateY(-50%)}
+.as-arrow.arr{top:8px;left:50%;transform:translateX(-50%)}
+.as-arrow.aba{bottom:52px;left:50%;transform:translateX(-50%)}
+@keyframes as-pulse{50%{opacity:.35}}
