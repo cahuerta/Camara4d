@@ -1,21 +1,13 @@
-// assist.js — Asistente de la toma: mapa de cobertura, indicaciones en vivo y barra de detección.
-// Solo lee el estado (imagen, seguimiento, modelo acumulado) y dibuja ayudas; no cambia la captura.
+// assist.js — Asistente de la toma: mapa de lo ya modelado, indicaciones en vivo y barra de detección.
+// Solo lee el estado y dibuja ayudas; no cambia la captura.
 // Crea sus propios elementos dentro de la caja del video y del contenedor de controles (index.html no cambia).
 
-export const VERSION = '2';
+export const VERSION = '3';
 
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
 export class Assist {
   constructor({ vidBox, controls }) {
-    // Foto guía: la última vista buena, semitransparente sobre el video, para volver a calzar la imagen
-    this.ghost = document.createElement('canvas');
-    this.ghost.className = 'as-ghost';
-    this.ghost.hidden = true;
-    vidBox.appendChild(this.ghost);
-    this.gctx = this.ghost.getContext('2d');
-    this.ghostImg = null;
-
     // Flecha grande hacia donde moverse
     this.arrow = document.createElement('div');
     this.arrow.className = 'as-arrow';
@@ -47,25 +39,22 @@ export class Assist {
   }
 
   reset() {
-    this.prevPts = null;       // posiciones de los puntos en el cuadro anterior (para la velocidad)
-    this.prevN = -1;
-    this.speed = 0;            // desplazamiento mediano por cuadro (px), suavizado
-    this.stillSince = 0;       // desde cuándo la cámara está casi quieta
+    this.prevPos = null;
+    this.speed = 0;
+    this.stillSince = 0;
     this.lastMap = 0;
     this.lastHint = '';
+    this.viewCov = 0;
     this.setDetection(0);
     this.map.hidden = true;
     this.hint.hidden = true;
     this.showArrow(null);
-    this.showGhost(null);
   }
 
-  // Al terminar: se deja el mapa final y se oculta la indicación
-  done(acc) {
+  done() {
     this.hint.hidden = true;
+    this.map.hidden = true;
     this.showArrow(null);
-    this.showGhost(null);
-    if (acc) this.drawMap(acc);
     this.setDetection(0);
   }
 
@@ -86,16 +75,6 @@ export class Assist {
     this.arrow.hidden = false;
   }
 
-  showGhost(img) {
-    if (!img) { this.ghost.hidden = true; this.ghostImg = null; return; }
-    if (img !== this.ghostImg) {
-      this.ghost.width = img.width; this.ghost.height = img.height;
-      this.gctx.putImageData(img, 0, 0);
-      this.ghostImg = img;
-    }
-    this.ghost.hidden = false;
-  }
-
   showHint(text) {
     if (text === this.lastHint) return;
     this.lastHint = text;
@@ -105,16 +84,15 @@ export class Assist {
 
   /*
    * Se llama en cada cuadro.
-   * st: { img (ImageData), tracker, acc, lost, capturing, roi, ghost (ImageData de la última vista buena) }
+   * st: { img (ImageData), pts (puntos seguidos), state ('init' | 'track' | 'lost'), view (proyección del modelo en
+   *       la vista actual: { w, h, factor, views } o null) }
    */
   update(st) {
     const now = performance.now();
-    const { img, tracker, acc } = st;
+    const { img, pts } = st;
 
-    // --- Imagen: luz y nitidez (sobre una muestra de píxeles) ---
+    // --- Imagen: luz y nitidez (sobre una muestra de píxeles; nitidez en las partes con detalle) ---
     const d = img.data, W = img.width, H = img.height;
-    // La nitidez se mide en las partes con detalle (percentil 75), para que una zona lisa grande
-    // (una mesa blanca, una pared) no haga parecer borrosa una imagen nítida
     let sum = 0, n = 0;
     const grads = [];
     for (let y = 4; y < H - 4; y += 6) for (let x = 4; x < W - 4; x += 6) {
@@ -126,112 +104,96 @@ export class Assist {
     grads.sort((a, b) => a - b);
     const bright = sum / n, sharp = grads[Math.floor(grads.length * 0.75)] || 0;
 
-    // --- Velocidad: cuánto se mueven los puntos entre cuadros ---
-    const ids = tracker.tracking ? tracker.aliveIds() : [];
-    if (tracker.N !== this.prevN || !this.prevPts) {
-      this.prevPts = tracker.cur ? tracker.cur.slice() : null;
-      this.prevN = tracker.N;
-    } else {
+    // --- Velocidad: desplazamiento mediano de los puntos entre cuadros ---
+    if (this.prevPos && pts.length) {
       const dist = [];
-      for (const i of ids) dist.push(Math.hypot(tracker.cur[2 * i] - this.prevPts[2 * i], tracker.cur[2 * i + 1] - this.prevPts[2 * i + 1]));
+      for (const p of pts) { const q = this.prevPos.get(p); if (q) dist.push(Math.hypot(p.x - q[0], p.y - q[1])); }
       dist.sort((a, b) => a - b);
       const m = dist.length ? dist[dist.length >> 1] : 0;
       this.speed = 0.6 * this.speed + 0.4 * m;
-      this.prevPts = tracker.cur.slice();
     }
+    this.prevPos = new Map(pts.map(p => [p, [p.x, p.y]]));
     if (this.speed < 0.6) { if (!this.stillSince) this.stillSince = now; } else this.stillSince = 0;
 
     // --- Barra de detección: puntos seguidos y textura ---
-    const ptsQ = clamp(ids.length / 200, 0, 1);
-    const texQ = clamp((sharp - 4) / 16, 0, 1);
-    this.setDetection(st.lost ? 0 : Math.sqrt(ptsQ * texQ));
+    const ptsQ = clamp(pts.length / 200, 0, 1), texQ = clamp((sharp - 4) / 16, 0, 1);
+    this.setDetection(st.state === 'lost' ? 0 : Math.sqrt(ptsQ * texQ));
 
-    // --- Mapa de cobertura (unas 3 veces por segundo) ---
-    if (acc && acc.fusions && now - this.lastMap > 330) { this.drawMap(acc); this.lastMap = now; }
+    // --- Mapa de lo ya modelado en esta vista (unas 3 veces por segundo) ---
+    let cov = null;
+    if (st.view && st.state === 'track') {
+      cov = this.coverage(img, st.view);
+      if (now - this.lastMap > 330) { this.drawMap(img, st.view, cov.zone); this.lastMap = now; }
+    } else if (st.state !== 'track') this.map.hidden = true;
 
-    // Seguimiento perdido: se muestra la última vista buena encima del video para calzarla
-    this.showGhost(st.capturing && st.lost ? st.ghost : null);
-
-    if (!st.capturing) { this.showHint(''); this.showArrow(null); return; }
-    const dec = this.decide(st, { bright, sharp, ids, now });
+    const dec = this.decide(st, { bright, sharp, now, cov });
     this.showHint(dec.text);
     this.showArrow(dec.arrow || null);
   }
 
-  // Elige la indicación más importante del momento: { text, arrow }
+  // Zonas con detalle de la vista actual y cuánto de ellas ya está en el modelo (por lado)
+  coverage(img, view) {
+    const { w, h, factor, views } = view, d = img.data, W = img.width;
+    const zone = new Uint8Array(w * h);
+    for (let y = 1; y < h - 1; y++) for (let x = 1; x < w - 1; x++) {
+      const px = x * factor, py = y * factor;
+      if (px + factor >= W || py + factor >= img.height) continue;
+      const o = (py * W + px) * 4, o2 = o + 4 * factor, o3 = o + 4 * factor * W;
+      const g = d[o] + d[o + 1] + d[o + 2], g2 = d[o2] + d[o2 + 1] + d[o2 + 2], g3 = d[o3] + d[o3 + 1] + d[o3 + 2];
+      if (Math.abs(g2 - g) + Math.abs(g3 - g) > 36) zone[y * w + x] = 1;
+    }
+    const reg = {
+      izq: { side: 'izq', tot: 0, miss: 0, text: 'Falta la izquierda: muévete hacia la izquierda' },
+      der: { side: 'der', tot: 0, miss: 0, text: 'Falta la derecha: muévete hacia la derecha' },
+      arr: { side: 'arr', tot: 0, miss: 0, text: 'Falta arriba: sube el teléfono y apunta abajo' },
+      aba: { side: 'aba', tot: 0, miss: 0, text: 'Falta abajo: baja el teléfono' }
+    };
+    let modeled = 0, tot = 0;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      if (views[i] >= 1) modeled++;
+      if (!zone[i]) continue;
+      tot++;
+      const miss = views[i] >= 2 ? 0 : 1;
+      const r1 = x < w / 2 ? reg.izq : reg.der, r2 = y < h / 2 ? reg.arr : reg.aba;
+      r1.tot++; r1.miss += miss; r2.tot++; r2.miss += miss;
+    }
+    let worst = null;
+    for (const r of Object.values(reg)) { r.missing = r.tot ? r.miss / r.tot : 0; if (!worst || r.missing > worst.missing) worst = r; }
+    this.viewCov = tot ? 1 - (reg.izq.miss + reg.der.miss) / Math.max(1, reg.izq.tot + reg.der.tot) : 0;
+    return { zone, worst, objFrac: modeled / (w * h) };
+  }
+
   decide(st, m) {
-    const { acc, tracker } = st;
-    if (st.lost) return { text: '🎯 Calza el video con la foto transparente' };
+    if (st.state === 'lost') return { text: '🔎 Buscando el objeto: apunta a una parte ya capturada' };
     if (m.bright < 45) return { text: '💡 Falta luz' };
     if (m.sharp < 4) return { text: '✋ Borroso: quieto un momento' };
     if (this.speed > 9) return { text: '🐢 Más lento' };
-    if (tracker.tracking && m.ids.length < 60) return { text: '🔍 Poca textura: apunta a más detalle' };
-
-    const cov = acc ? this.regions(acc) : null;
-    if (cov && acc.fusions >= 1 && cov.objFrac < 0.1) return { text: '⬆ Acércate' };
-    if (cov && acc.fusions >= 1 && cov.objFrac > 0.85) return { text: '⬇ Aléjate un poco' };
-    if (this.stillSince && m.now - this.stillSince > 1500) return { text: '↔ Muévete de lado', arrow: cov && cov.worst ? cov.worst.side : 'der' };
-    if (cov && acc.fusions >= 2) {
-      const r = cov.worst;
-      if (r && r.missing > 0.3) return { text: r.text, arrow: r.side };
-    }
-    if (acc && acc.fusions) return { text: '✔ Bien, sigue así' };
-    return { text: '↔ Muévete despacio de lado', arrow: 'der' };
+    if (st.state === 'init') return { text: '↔ Muévete despacio de lado para empezar', arrow: 'der' };
+    if (st.pts.length < 60) return { text: '🔍 Poca textura: apunta a más detalle' };
+    const c = m.cov;
+    if (c && c.objFrac > 0 && c.objFrac < 0.06) return { text: '⬆ Acércate' };
+    if (this.stillSince && m.now - this.stillSince > 1500) return { text: '↻ Sigue girando alrededor del objeto', arrow: 'der' };
+    if (c && c.worst && c.worst.missing > 0.4) return { text: c.worst.text, arrow: c.worst.side };
+    return { text: '✔ Bien: sigue girando para sumar más caras' };
   }
 
-  // Cobertura por zonas del objeto: qué parte falta más y qué tan grande se ve el objeto
-  regions(acc) {
-    const W = acc.w, H = acc.h;
-    let x0 = W, x1 = 0, y0 = H, y1 = 0, anyZone = 0;
-    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
-      const i = y * W + x;
-      if (!acc.zone[i] || acc.bg[i] > acc.cnt[i]) continue;
-      anyZone++;
-      if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
-    }
-    if (!anyZone) return null;
-    const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
-    const reg = {
-      izq: { side: 'izq', tot: 0, miss: 0, text: 'Falta la izquierda: ve a la izquierda' },
-      der: { side: 'der', tot: 0, miss: 0, text: 'Falta la derecha: ve a la derecha' },
-      arr: { side: 'arr', tot: 0, miss: 0, text: 'Falta arriba: sube y apunta abajo' },
-      aba: { side: 'aba', tot: 0, miss: 0, text: 'Falta abajo: baja el teléfono' }
-    };
-    let measured = 0;
-    for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
-      const i = y * W + x;
-      if (acc.cnt[i] >= 1) measured++;
-      if (!acc.zone[i] || acc.bg[i] > acc.cnt[i]) continue;
-      const miss = acc.cnt[i] < 2 ? 1 : 0;
-      const k1 = x < cx ? reg.izq : reg.der, k2 = y < cy ? reg.arr : reg.aba;
-      k1.tot++; k1.miss += miss; k2.tot++; k2.miss += miss;
-    }
-    let worst = null;
-    for (const r of Object.values(reg)) {
-      r.missing = r.tot ? r.miss / r.tot : 0;
-      if (!worst || r.missing > worst.missing) worst = r;
-    }
-    // Tamaño aparente del objeto: fracción de la imagen con profundidad medida
-    let withDepth = 0;
-    for (let i = 0; i < acc.cnt.length; i++) if (acc.cnt[i] >= 1) withDepth++;
-    return { worst, objFrac: withDepth / acc.cnt.length };
-  }
-
-  // Miniatura de la imagen de partida: verde = confirmado, amarillo = medido una vez, rojo = falta
-  drawMap(acc) {
-    const W = acc.w, H = acc.h;
-    if (this.map.width !== W || this.map.height !== H) { this.map.width = W; this.map.height = H; }
-    const im = this.mctx.createImageData(W, H), o = im.data;
-    for (let i = 0; i < W * H; i++) {
-      let r = acc.rgb[3 * i], g = acc.rgb[3 * i + 1], b = acc.rgb[3 * i + 2];
-      const gray = 0.299 * r + 0.587 * g + 0.114 * b;
-      r = g = b = gray * 0.55;   // fondo apagado para que se lean los colores
-      if (acc.cnt[i] >= 2) { r = r * 0.4; g = g * 0.4 + 150; b = b * 0.4 + 60; }
-      else if (acc.cnt[i] === 1) { r = r * 0.4 + 170; g = g * 0.4 + 140; b = b * 0.4; }
-      else if (acc.zone[i] && !(acc.bg[i] > acc.cnt[i])) { r = r * 0.5 + 120; g = g * 0.5; b = b * 0.5; }
+  // Miniatura de la vista: verde = modelado (2+ vistas), amarillo = 1 vista, rojo = con detalle y sin modelar
+  drawMap(img, view, zone) {
+    const { w, h, factor, views } = view;
+    if (this.map.width !== w || this.map.height !== h) { this.map.width = w; this.map.height = h; }
+    const im = this.mctx.createImageData(w, h), o = im.data, d = img.data, W = img.width;
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const i = y * w + x, px = Math.min(img.width - 1, x * factor), py = Math.min(img.height - 1, y * factor);
+      const s = (py * W + px) * 4, gray = (0.299 * d[s] + 0.587 * d[s + 1] + 0.114 * d[s + 2]) * 0.5;
+      let r = gray, g = gray, b = gray;
+      if (views[i] >= 2) { r = gray * 0.4; g = gray * 0.4 + 150; b = gray * 0.4 + 60; }
+      else if (views[i] === 1) { r = gray * 0.4 + 170; g = gray * 0.4 + 140; b = gray * 0.4; }
+      else if (zone[i]) { r = gray * 0.5 + 120; g = gray * 0.5; b = gray * 0.5; }
       o[4 * i] = r; o[4 * i + 1] = g; o[4 * i + 2] = b; o[4 * i + 3] = 255;
     }
     this.mctx.putImageData(im, 0, 0);
     this.map.hidden = false;
   }
-}
+  }
+    
