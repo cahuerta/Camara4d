@@ -498,7 +498,10 @@ export function serverApi(base) {
     has: id => fetch(url('/tomas/' + encodeURIComponent(id)), { method: 'HEAD' }).then(r => r.ok),
     get: id => fetch(url('/tomas/' + encodeURIComponent(id))).then(j),
     upload: T => fetch(url('/tomas'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(T) }).then(j),
-    merge: ids => fetch(url('/unir'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids }) }).then(j)
+    merge: ids => fetch(url('/unir'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids }) }).then(j),
+    // Unión en segundo plano con avance (servidor nuevo); si el servidor no la tiene, responde 404/405
+    start: ids => fetch(url('/unir/iniciar'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids }) }).then(j),
+    status: id => fetch(url('/unir/' + encodeURIComponent(id))).then(j)
   };
                                                                        }
   

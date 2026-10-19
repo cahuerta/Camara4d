@@ -93,7 +93,7 @@ const med = a => { if (!a.length) return 0; const q = a.slice().sort((x, y) => x
 
 /* ---------- Versión y textos de la página ---------- */
 // index.html es fijo: la versión, los textos y los controles nuevos los pone este archivo.
-const APP_VERSION = '14';
+const APP_VERSION = '15';
 const showErr = m => (window.showAppError ? window.showAppError(m) : stat(m));
 $('title').innerHTML = 'Cámara 4D <span>v' + APP_VERSION + '</span>';
 $('help').textContent = 'El modelo 3D se arma con la profundidad de cada píxel y crece con cada vista. Un dedo gira, el pellizco (o la rueda del mouse) acerca y aleja. ' +
@@ -743,11 +743,9 @@ async function finish() {
   try { for (const T of tomas) await localTomas.save(T); msg += ' Guardada en el teléfono'; } catch (e) { msg += ' No se pudo guardar en el teléfono (' + e.message + ')'; }
   stat(msg + '; subiendo al servidor…');
   try {
-    for (const T of tomas) await api().upload(T);
+    const res = await serverMerge(tomas.map(T => T.id), tomas);
     msg += ' y en el servidor.';
-    if (tomas.length > 1) {
-      stat(msg + ' Uniendo las partes en el servidor…');
-      const res = await api().merge(tomas.map(T => T.id));
+    if (res) {
       const U = res.toma;
       await localTomas.save(U).catch(() => {});
       const unidas = res.detalle.filter(d => d.unida).length;
@@ -762,6 +760,88 @@ async function finish() {
   stat(msg);
   resNote.textContent = msg;
   if (tab === 'tomas') renderTomas();
+}
+
+/* ---------- Barra de avance (subir y unir en el servidor) ---------- */
+// Queda fija bajo el menú, así se ve desde cualquier pantalla.
+const job = (() => {
+  const el = document.createElement('div');
+  el.className = 'jobbar';
+  el.hidden = true;
+  el.innerHTML = '<div class="jb-txt"><span class="jb-lbl"></span><span class="jb-pct"></span></div><div class="jb-bar"><div class="jb-fill"></div></div>';
+  const lbl = el.querySelector('.jb-lbl'), pct = el.querySelector('.jb-pct'), fill = el.querySelector('.jb-fill');
+  let t0 = 0, frac = 0, hideT = null, tick = null;
+  const paint = () => { pct.textContent = Math.round(100 * frac) + ' % · ' + Math.round((performance.now() - t0) / 1000) + ' s'; };
+  return {
+    el,
+    start(text) {
+      clearTimeout(hideT); clearInterval(tick);
+      t0 = performance.now(); frac = 0;
+      el.hidden = false; el.className = 'jobbar';
+      tick = setInterval(paint, 500);
+      this.set(0, text);
+    },
+    set(f, text, busy = false) {
+      frac = Math.max(frac, Math.min(1, f));
+      fill.style.width = (100 * frac).toFixed(1) + '%';
+      if (text) lbl.textContent = text;
+      el.classList.toggle('busy', busy);
+      paint();
+    },
+    end(ok, text) {
+      clearInterval(tick);
+      if (ok) this.set(1, text); else lbl.textContent = text;
+      el.classList.remove('busy');
+      el.classList.add(ok ? 'ok' : 'bad');
+      paint();
+      hideT = setTimeout(() => { el.hidden = true; }, ok ? 8000 : 15000);
+    }
+  };
+})();
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// Sube las tomas que falten y une ids en el servidor, mostrando el avance real del servidor
+async function serverMerge(ids, uploads) {
+  const A = api();
+  job.start('Conectando con el servidor…');
+  try {
+    // 1. Servidor despierto (en Render gratis duerme y tarda hasta ~1 minuto en despertar)
+    job.set(0.02, 'Conectando con el servidor…', true);
+    const tw = setTimeout(() => job.set(0.02, 'Despertando el servidor (puede tardar hasta 1 minuto)…', true), 3000);
+    try { await A.health(); } finally { clearTimeout(tw); }
+    // 2. Subir lo que falte
+    for (let i = 0; i < uploads.length; i++) {
+      job.set(0.05 + 0.15 * i / uploads.length, 'Subiendo toma ' + (i + 1) + ' de ' + uploads.length + '…');
+      await A.upload(uploads[i]);
+    }
+    if (ids.length < 2) { job.end(true, 'Listo: toma subida al servidor.'); return null; }
+    // 3. Unir (con avance real si el servidor lo permite)
+    job.set(0.2, 'Uniendo en el servidor…');
+    let res;
+    let trabajo = null;
+    try { trabajo = (await A.start(ids)).trabajo; }
+    catch (e) { if (!/servidor (404|405)/.test(e.message)) throw e; }
+    if (trabajo) {
+      for (;;) {
+        await sleep(700);
+        const st = await A.status(trabajo);
+        if (st.estado === 'error') throw new Error(st.error || 'error al unir');
+        job.set(0.2 + 0.72 * (st.avance || 0) / 100, 'Servidor: ' + (st.etapa || st.estado), st.estado === 'en cola');
+        if (st.estado === 'listo') { res = st.resultado; break; }
+      }
+      job.set(0.93, 'Bajando el resultado…');
+      res = { toma: await A.get(res.id), informe: res.informe, detalle: res.detalle };
+    } else {
+      job.set(0.2, 'Uniendo en el servidor…', true);
+      res = await A.merge(ids);
+    }
+    const unidas = res.detalle.filter(d => d.unida).length;
+    job.end(unidas > 1, unidas > 1 ? 'Listo: ' + unidas + ' de ' + ids.length + ' tomas unidas.' : 'No se pudieron unir: no comparten una zona clara.');
+    return res;
+  } catch (e) {
+    job.end(false, 'Error: ' + e.message);
+    throw e;
+  }
 }
 
 /* ---------- Tomas: ver, subir y unir (servidor) ---------- */
@@ -841,20 +921,23 @@ async function mergeSelected(list) {
   stat('Uniendo ' + ids.length + ' tomas en el servidor…');
   try {
     // Las tomas que están solo en el teléfono se suben primero
+    const uploads = [];
     for (const id of ids) {
       const t = list.find(x => x.id === id);
-      if (t && t.local && !(await api().has(id))) await api().upload(await localTomas.get(id));
+      if (t && t.local && !t.server) uploads.push(await localTomas.get(id));
     }
-    const res = await api().merge(ids);
+    const res = await serverMerge(ids, uploads);
     const T = res.toma;
     await localTomas.save(T).catch(() => {});
-    const m = Model.fromToma(T);
-    const c = m.cloud(cleanBg);
-    if (c) { cloud = c; viewer.setCloud(cloud); viewer.frontView(); }
-    lastToma = T;
+    if (res.detalle.filter(d => d.unida).length > 1) {
+      const m = Model.fromToma(T);
+      const c = m.cloud(cleanBg, 60000, true);
+      if (c) { cloud = c; viewer.setCloud(cloud); viewer.frontView(); }
+      lastToma = T;
+      resNote.textContent = 'Unión: ' + res.informe;
+      showTab('res');
+    }
     stat('Tomas unidas: ' + res.informe);
-    resNote.textContent = 'Unión: ' + res.informe;
-    showTab('res');
     renderTomas();
   } catch (e) { stat('No se pudieron unir: ' + e.message); }
 }
@@ -1032,7 +1115,7 @@ const showTab = (() => {
     btn[id] = b;
   }
   $('title').before(top);
-  top.append($('title'), nav);
+  top.append($('title'), nav, job.el);
 
   // Pantalla Captura
   const pCap = document.createElement('section');
