@@ -1,6 +1,6 @@
 // export.js — Exporta la nube, las poses y los datos de sensores a un archivo JSON.
 
-export function exportJSON({ cloud, poses, imu, fov, size }) {
+export function exportJSON({ cloud, poses, imu, fov, size, extra }) {
   const data = {
     version: 2,
     nota: 'Nube con escala relativa (mediana de distancia al centro = 1). imu = [t_ms, ax, ay, az (con gravedad, m/s²), alpha, beta, gamma (°/s)]; poses.t usa el mismo reloj (ms).',
@@ -11,7 +11,8 @@ export function exportJSON({ cloud, poses, imu, fov, size }) {
       w: +c[3].toFixed(3), rgb: [c[4], c[5], c[6]]
     })),
     poses,
-    imu
+    imu,
+    ...(extra || {})   // datos adicionales (p. ej., los fragmentos de la captura)
   };
   const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
   const a = document.createElement('a');
