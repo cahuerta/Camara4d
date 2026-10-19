@@ -102,7 +102,7 @@ const med = a => { if (!a.length) return 0; const q = a.slice().sort((x, y) => x
 
 /* ---------- Versión y textos de la página ---------- */
 // index.html es fijo: la versión, los textos y los controles nuevos los pone este archivo.
-const APP_VERSION = '19';
+const APP_VERSION = '20';
 const showErr = m => (window.showAppError ? window.showAppError(m) : stat(m));
 $('title').innerHTML = 'Cámara 4D <span>v' + APP_VERSION + '</span>';
 $('help').textContent = 'El modelo 3D se arma con la profundidad de cada píxel y crece con cada vista. Un dedo gira, el pellizco (o la rueda del mouse) acerca y aleja. ' +
@@ -281,12 +281,12 @@ function step() {
   frameNo++;
   rec.frame(frameNo);
   if (sheetMode) {
+    // Nitidez de este cuadro (para no guardar vistas movidas); se mide antes de decidir si es vista nueva
+    frameSharp = sharpness(img);
+    sharpHist.push(frameSharp); if (sharpHist.length > 40) sharpHist.shift();
     stepSheet(img);
-    if (state === 'track' && pose && performance.now() - viewAt > 300) {
-      viewProj = model.project(pose.R, pose.t, intr.f, intr.cx, intr.cy, intr.w, intr.h, 4);
-      viewAt = performance.now();
-    }
-    if (running) assist.update({ img, pts: [], state: state === 'track' ? 'track' : 'init', view: state === 'track' ? viewProj : null,
+    // Con la hoja la guía es la vuelta (12 lados): no se proyecta el modelo en cada cuadro (era lo más lento)
+    if (running) assist.update({ img, pts: [], state: state === 'track' ? 'track' : 'init', view: null,
       det: Math.min(1, sheetDets.length / 10), msg: sheetMsg });
     drawOverlay();
     return;
@@ -322,6 +322,25 @@ function startSheet() {
     model.obj = { c: [0, 0, 0.05], r: 0.2 };
     vol = new Volume(model.hoja, 0.002, 0.16);
   }
+}
+
+// Nitidez: diferencia media entre píxeles vecinos en una muestra (las fotos movidas tienen bordes suaves)
+let frameSharp = 0;
+const sharpHist = [];
+function sharpness(img) {
+  const d = img.data, W = img.width, H = img.height;
+  let s = 0, n = 0;
+  for (let y = 8; y < H - 8; y += 6) for (let x = 8; x < W - 8; x += 6) {
+    const o = (y * W + x) * 4;
+    s += Math.abs(d[o + 1] - d[o + 5]) + Math.abs(d[o + 1] - d[o + 1 + 4 * W]);
+    n++;
+  }
+  return s / n;
+}
+function isSharp() {
+  if (sharpHist.length < 8) return true;
+  const q = sharpHist.slice().sort((a, b) => a - b);
+  return frameSharp >= 0.75 * q[Math.floor(q.length * 0.6)];
 }
 
 const refineSheet = (X, uv, f, cx, cy, R, t) => pnpRefine(X, uv, f, cx, cy, R, t, { iters: 8, sigma: 1.5, thr: 3 });
@@ -376,7 +395,7 @@ function stepSheet(img) {
   }
   // Vistas guardadas: al moverse o girar lo suficiente
   if (!lastKf) { createKf(img); return; }
-  if (jobs.length + (jobBusy ? 1 : 0) <= 1 && volBusy <= 1) {
+  if (jobs.length + (jobBusy ? 1 : 0) <= 1 && volBusy <= 1 && isSharp()) {
     const C = camCenter(pose.R, pose.t), Ck = camCenter(lastKf.R, lastKf.t);
     const depth = Math.hypot(C[0], C[1], C[2]) || 0.3;
     const base = Math.hypot(C[0] - Ck[0], C[1] - Ck[1], C[2] - Ck[2]) / depth;
@@ -407,7 +426,7 @@ function showVolume(colored) {
     const surf = vol.surface();
     for (const k of kfList) if (k.small) vol.paint(k.small, k.R, k.t, intr.f / 2, intr.cx / 2, intr.cy / 2, surf, 1);
   }
-  volPts = vol.points();
+  volPts = vol.points(colored);   // grupos sueltos: solo al final (es lento)
   const c = viewerCloud(volPts, vol.vox, colored);
   if (!c) return false;
   cloud = c;
@@ -639,7 +658,8 @@ function onDepth(kf, dm, M = model, L = kfList) {
     }
     if (ds.length > 30) M.voxel = med(ds) * 2.5 / dm.f;
   }
-  M.fuseDepth(dm, kf.R, kf.t, kf.id);
+  // Con la hoja el resultado son las capas (volumen): la nube de puntos no se arma (era lenta en el teléfono)
+  if (M.hoja) M.depthMaps++; else M.fuseDepth(dm, kf.R, kf.t, kf.id);
   // CAPA 2 · relieve: la profundidad medida vacía lo que está claramente delante de la superficie
   if (sheetMode && vol && M === model) vol.relief(dm, kf.R, kf.t);
   if (ses && sheetMode && M === model) sesSendDepth(kf, dm);
@@ -838,7 +858,7 @@ function refreshCloud(force) {
   cloudAt = now;
   if (ses && sesPts) { updateProgress(); return; }   // en sesión se muestra el modelo del servidor
   if (sheetMode && vol && cleanBg) {
-    if (now - volAt > 3000 || (force && state === 'done')) { volAt = now; showVolume(state === 'done'); }
+    if (now - volAt > 6000 || (force && state === 'done')) { volAt = now; showVolume(state === 'done'); }
     updateProgress();
     return;
   }

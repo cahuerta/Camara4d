@@ -137,9 +137,11 @@ function maskAt(img, R, t, f, cx, cy, S, blur, r, erode, search = 0) {
 // Se ve la hoja si cualquiera de las dos lo asegura; algo la tapa si ninguna la ve.
 export function sheetMask(img, R, t, f, cx, cy) {
   const fine = maskAt(img, R, t, f, cx, cy, 1, false, 3, 1), coarse = maskAt(img, R, t, f, cx, cy, 2, true, 4, 2, 2);
+  // Tercera, aún más gruesa (cuarto de resolución): para papel arrugado o con dobleces
+  const rough = maskAt(img, R, t, f, cx, cy, 4, true, 3, 1, 1);
   for (let i = 0; i < fine.length; i++) {
-    if (fine[i] === 1 || coarse[i] === 1) fine[i] = 1;
-    else if (fine[i] === 2 || coarse[i] === 2) fine[i] = 2;
+    if (fine[i] === 1 || coarse[i] === 1 || rough[i] === 1) fine[i] = 1;
+    else if (fine[i] === 2 || coarse[i] === 2 || rough[i] === 2) fine[i] = 2;
   }
   return fine;
 }
@@ -169,7 +171,17 @@ export class Volume {
     if (s < 3) return false;
     if (e > Math.max(1, 0.1 * (e + s))) return false;
     if (this.free[i] >= 2 && this.free[i] * 3 > s) return false;
+    // Más arriba que lo más alto medido por las profundidades: vacío (las vistas desde arriba no lo pueden tallar)
+    if (this.zTop && Math.floor(i / (this.nx * this.ny)) * this.vox > this.zTop + 3 * this.vox) return false;
     return true;
+  }
+
+  // Altura del objeto según los mapas de profundidad (percentil alto, para ignorar errores sueltos)
+  _updateTop() {
+    const z = this.heights;
+    if (z.length < 400) { this.zTop = 0; return; }
+    const q = z.slice().sort((a, b) => a - b);
+    this.zTop = q[Math.floor(q.length * 0.97)];
   }
 
   // 1. FORMA: tallar con una vista
@@ -205,6 +217,17 @@ export class Volume {
   // 2. RELIEVE: un mapa de profundidad (vista R,t; a 1/factor de resolución) vacía lo que está claramente delante
   relief(dm, R, t) {
     const { w, h, f, cx, cy, depth } = dm, { nx, ny, nz, vox, x0, y0 } = this;
+    // Alturas de lo medido sobre la zona libre (para saber hasta dónde llega el objeto)
+    if (!this.heights) this.heights = [];
+    for (let v = 1; v < h - 1; v += 2) for (let u = 1; u < w - 1; u += 2) {
+      const dd = depth[v * w + u];
+      if (!(dd > 0)) continue;
+      const a = dd * (u - cx) / f - t[0], b = dd * (v - cy) / f - t[1], c = dd - t[2];
+      const X = R[0] * a + R[3] * b + R[6] * c, Y = R[1] * a + R[4] * b + R[7] * c, Z = R[2] * a + R[5] * b + R[8] * c;
+      if (Z > 0.003 && X > x0 && X < x0 + nx * vox && Y > y0 && Y < y0 + ny * vox) this.heights.push(Z);
+    }
+    if (this.heights.length > 40000) this.heights = this.heights.filter((_, k) => k % 2);
+    this._updateTop();
     for (let iz = 0; iz < nz; iz++) {
       const Z = (iz + 0.5) * vox;
       for (let iy = 0; iy < ny; iy++) {
@@ -285,7 +308,7 @@ export class Volume {
   }
 
   // Puntos de la piel con color (los que ninguna vista vio toman el color de sus vecinos, en varias pasadas)
-  points() {
+  points(groups = true) {
     const surf = this.surface(), { nx, ny } = this, nxy = nx * ny, out = [];
     const C = new Map();
     // Un cubito real se ve del mismo color desde todas las vistas; si cada vista ve algo distinto, no es superficie
@@ -312,6 +335,7 @@ export class Volume {
     }
     // Grupos sueltos (motas flotando): se deja el bloque mayor y los que tengan al menos 1/6 de su tamaño
     const inS = new Set(surf.idx), comp = new Map(), sizes = [];
+    if (!groups) { for (const i of surf.idx) { const P = this.center(i), c = C.get(i) || [150, 150, 150]; out.push([P[0], P[1], P[2], c[0], c[1], c[2]]); } return out; }
     for (const i0 of surf.idx) {
       if (comp.has(i0)) continue;
       const id = sizes.length, st = [i0];
