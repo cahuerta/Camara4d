@@ -99,3 +99,7 @@ body.app .tomas{border:0;padding:0;background:transparent}
 @keyframes jb-move{from{transform:translateX(-100%)}to{transform:translateX(100%)}}
 .jobbar.ok{border-color:#1f5e3c}.jobbar.ok .jb-fill{background:#3ddc84}
 .jobbar.bad{border-color:#5e1f24}.jobbar.bad .jb-fill{background:#ff5d5d}.jobbar.bad .jb-lbl{color:#ffb3b3;white-space:normal}
+/* Sesión con varias cámaras (v18) */
+.ses-line{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:8px;padding:8px 10px;border:1px solid #1f5e3c;background:#0f1f17;color:#3ddc84;border-radius:10px;font-size:13px}
+.ses-line[hidden]{display:none}
+.ses-line button{padding:6px 10px;font-size:13px}

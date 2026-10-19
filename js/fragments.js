@@ -5,7 +5,7 @@
 //  · Vistas guardadas: firmas de puntos con su posición 3D, para reconocer el objeto desde cualquier cara.
 //  · Toma: el modelo + sus vistas, empaquetado para guardar en el teléfono y subir al servidor, que une tomas.
 
-export const VERSION = '4';
+export const VERSION = '5';
 
 const OFF = 32768, SH = 65536;
 const keyOf = (ix, iy, iz) => ((ix + OFF) * SH + (iy + OFF)) * SH + (iz + OFF);
@@ -557,7 +557,21 @@ export function serverApi(base) {
     merge: ids => fetch(url('/unir'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids }) }).then(j),
     // Unión en segundo plano con avance (servidor nuevo); si el servidor no la tiene, responde 404/405
     start: ids => fetch(url('/unir/iniciar'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ids }) }).then(j),
-    status: id => fetch(url('/unir/' + encodeURIComponent(id))).then(j)
+    status: id => fetch(url('/unir/' + encodeURIComponent(id))).then(j),
+    // Sesiones con varias cámaras
+    sesionCrear: nombre => fetch(url('/sesiones'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ nombre }) }).then(j),
+    sesion: c => fetch(url('/sesiones/' + encodeURIComponent(c))).then(j),
+    sesionUnir: (c, nombre) => fetch(url('/sesiones/' + encodeURIComponent(c) + '/camaras'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ nombre }) }).then(j),
+    sesionPost: async (path, obj) => {
+      // Se comprime (gzip) si el navegador lo permite: las vistas pesan
+      let body = JSON.stringify(obj), headers = { 'Content-Type': 'application/json' };
+      if (typeof CompressionStream !== 'undefined') {
+        body = await new Response(new Blob([body]).stream().pipeThrough(new CompressionStream('gzip'))).blob();
+        headers['Content-Encoding'] = 'gzip';
+      }
+      return fetch(url(path), { method: 'POST', headers, body }).then(j);
+    },
+    sesionModelo: (c, desde) => fetch(url('/sesiones/' + encodeURIComponent(c) + '/modelo?desde=' + desde)).then(j)
   };
                                                                        }
   

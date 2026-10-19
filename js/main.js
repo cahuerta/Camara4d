@@ -18,7 +18,7 @@ import { detectMarkers, correspondences, poseFromHomography, reprojError, FocalC
 import { Viewer } from './viewer.js';
 import { exportJSON } from './export.js';
 import { Assist, VERSION as ASSIST_VERSION } from './assist.js';
-import { Model, camCenter, toWorld, localTomas, serverApi, alignModels, movePose, b64, VERSION as MODEL_VERSION } from './fragments.js';
+import { Model, camCenter, toWorld, localTomas, serverApi, alignModels, movePose, b64, unb64, VERSION as MODEL_VERSION } from './fragments.js';
 
 const $ = id => document.getElementById(id);
 
@@ -102,7 +102,7 @@ const med = a => { if (!a.length) return 0; const q = a.slice().sort((x, y) => x
 
 /* ---------- Versión y textos de la página ---------- */
 // index.html es fijo: la versión, los textos y los controles nuevos los pone este archivo.
-const APP_VERSION = '17';
+const APP_VERSION = '18';
 const showErr = m => (window.showAppError ? window.showAppError(m) : stat(m));
 $('title').innerHTML = 'Cámara 4D <span>v' + APP_VERSION + '</span>';
 $('help').textContent = 'El modelo 3D se arma con la profundidad de cada píxel y crece con cada vista. Un dedo gira, el pellizco (o la rueda del mouse) acerca y aleja. ' +
@@ -114,7 +114,7 @@ stat('Pulsa «Iniciar cámara» y gira alrededor del objeto. Todo se suma a un s
   if (GEOMETRY_VERSION !== '6') bad.push('js/geometry.js');
   if (DENSE_VERSION !== '8') bad.push('js/dense.js');
   if (ASSIST_VERSION !== '4') bad.push('js/assist.js');
-  if (MODEL_VERSION !== '4') bad.push('js/fragments.js');
+  if (MODEL_VERSION !== '5') bad.push('js/fragments.js');
   if (HOJA_VERSION !== '1') bad.push('js/hoja.js');
   if (VOL_VERSION !== '1') bad.push('js/volumen.js');
   if (bad.length) showErr('Archivos de otra versión: ' + bad.join(', ') + '. Súbelos de nuevo.');
@@ -165,7 +165,10 @@ try {
 // Tallar el volumen con una vista: la máscara se calcula en segundo plano y el tallado al recibirla
 function carveView(kf) {
   const v = vol, cap = capNo, I = intr, img = kf.img;
-  const done = mask => { if (vol === v && capNo === cap && mask) { v.carveMask(mask, img.width, img.height, kf.R, kf.t, I.f, I.cx, I.cy); kf.carved = true; } };
+  const done = mask => {
+    if (vol === v && capNo === cap && mask) { v.carveMask(mask, img.width, img.height, kf.R, kf.t, I.f, I.cx, I.cy); kf.carved = true; }
+    if (mask && ses && capNo === cap) sesSendView(kf, img, mask, I);
+  };
   if (!volWorker) { done(sheetMask(img, kf.R, kf.t, I.f, I.cx, I.cy)); return; }
   const copy = { data: new Uint8ClampedArray(img.data), width: img.width, height: img.height };
   const id = ++volSeq;
@@ -639,6 +642,7 @@ function onDepth(kf, dm, M = model, L = kfList) {
   M.fuseDepth(dm, kf.R, kf.t, kf.id);
   // CAPA 2 · relieve: la profundidad medida vacía lo que está claramente delante de la superficie
   if (sheetMode && vol && M === model) vol.relief(dm, kf.R, kf.t);
+  if (ses && sheetMode && M === model) sesSendDepth(kf, dm);
   kf.hasDepth = true;
   const F = FACTOR, f = intr.f, cx = intr.cx, cy = intr.cy;
   // Posición 3D de un píxel de esta vista según su mapa de profundidad
@@ -832,6 +836,7 @@ function refreshCloud(force) {
   const now = performance.now();
   if (!force && now - cloudAt < 500) return;
   cloudAt = now;
+  if (ses && sesPts) { updateProgress(); return; }   // en sesión se muestra el modelo del servidor
   if (sheetMode && vol && cleanBg) {
     if (now - volAt > 3000 || (force && state === 'done')) { volAt = now; showVolume(state === 'done'); }
     updateProgress();
@@ -904,7 +909,26 @@ async function finish() {
   showTab('res');
   octx.clearRect(0, 0, ov.width, ov.height);
   if (kf0 && kf0.img) octx.putImageData(kf0.img, 0, 0);
-  const usaCapas = sheetMode && vol && volPts && volPts.length >= 50;
+  // En sesión: el resultado es el modelo común del servidor (se espera a que lleguen las últimas vistas)
+  if (ses) {
+    stat('Terminando: enviando las últimas vistas a la sesión…');
+    const t1 = performance.now();
+    while ((sesQueue.length || sesSending) && performance.now() - t1 < 20000) await sleep(200);
+    try {
+      const M = await api().sesionModelo(ses.codigo, -1);
+      if (M.n) {
+        const xyz = new Float32Array(unb64(M.xyz)), rgb = new Uint8Array(unb64(M.rgb)), P = [];
+        for (let i = 0; i < M.n; i++) P.push([xyz[3 * i], xyz[3 * i + 1], xyz[3 * i + 2], rgb[3 * i], rgb[3 * i + 1], rgb[3 * i + 2]]);
+        sesPts = { P, voxel: M.voxel, medidas: M.medidas_mm, vistas: M.vistas };
+        ses.version = M.version;
+        const c = viewerCloud(P, M.voxel, true);
+        if (c) { cloud = c; viewer.setCloud(cloud); }
+      }
+    } catch (e) { /* se usa lo local */ }
+  }
+  const usaSesion = !!(ses && sesPts && sesPts.P.length >= 50);
+  if (usaSesion) { volPts = sesPts.P; }
+  const usaCapas = sheetMode && ((vol && volPts && volPts.length >= 50) || usaSesion);
   const n = usaCapas ? volPts.length : model.countVisible(cleanBg);
   if (n < 50) { stat('Captura terminada sin datos suficientes. Pulsa «Nueva captura» y muévete más lento, con buena luz.'); return; }
   // Cada tramo que quedó sin unir se guarda como parte; el servidor las une después, solo
@@ -913,11 +937,15 @@ async function finish() {
   const tomas = all.map((m, i) => m.toToma({
     id: all.length > 1 ? base + '-p' + (i + 1) : base,
     nombre: all.length > 1 ? nombre + ' · parte ' + (i + 1) + ' de ' + all.length : nombre,
-    fecha: fecha.toISOString(), intr, voxel: usaCapas && i === 0 ? vol.vox : undefined
+    fecha: fecha.toISOString(), intr, voxel: usaCapas && i === 0 ? (usaSesion ? sesPts.voxel : vol.vox) : undefined
   }, usaCapas && i === 0 ? volPts : null));
   lastToma = tomas[0];
   let msg = 'Captura terminada: ' + n.toLocaleString('es-CL') + ' puntos desde ' + model.kfs.length + ' vistas' + (all.length > 1 ? ' (quedaron ' + all.length + ' partes sin unir en el teléfono)' : '') + '.';
-  if (usaCapas) { const sz = sizeOf(volPts); msg = 'Objeto listo (forma + relieve + color): ' + n.toLocaleString('es-CL') + ' cubitos de 2 mm desde ' + vol.views + ' vistas. Medidas: ' + sz.join(' × ') + ' mm (ancho × fondo × alto).'; }
+  if (usaCapas) {
+    const sz = sizeOf(volPts);
+    msg = usaSesion ? 'Modelo común de la sesión ' + ses.codigo + ' (todas las cámaras): ' + n.toLocaleString('es-CL') + ' cubitos de ' + (sesPts.voxel * 1000).toFixed(1) + ' mm desde ' + sesPts.vistas + ' vistas. Medidas: ' + sz.join(' × ') + ' mm (ancho × fondo × alto).'
+      : 'Objeto listo (forma + relieve + color): ' + n.toLocaleString('es-CL') + ' cubitos de 2 mm desde ' + vol.views + ' vistas. Medidas: ' + sz.join(' × ') + ' mm (ancho × fondo × alto).';
+  }
   stat(msg + ' Guardando…');
   try { for (const T of tomas) await localTomas.save(T); msg += ' Guardada en el teléfono'; } catch (e) { msg += ' No se pudo guardar en el teléfono (' + e.message + ')'; }
   stat(msg + '; subiendo al servidor…');
@@ -940,6 +968,131 @@ async function finish() {
   resNote.textContent = msg;
   if (tab === 'tomas') renderTomas();
 }
+
+/* ---------- VARIAS CÁMARAS: sesión en el servidor ----------
+   Una sesión es lo que queremos reconocer. Un teléfono la crea (con un nombre) y recibe un código de 4 letras;
+   los demás se unen con ese código. Todos capturan con la misma hoja, así que sus vistas ya comparten espacio.
+   Cada vista (imagen, posición, máscara de la hoja y profundidad) se envía al servidor, que arma un solo modelo
+   con las vistas de todas las cámaras. Cada teléfono ve ese modelo común en «Resultado». */
+let ses = null, sesPts = null, sesQueue = [], sesSending = false, sesInfo = null, paintModeBtn = () => {};
+const sesBtn = document.createElement('button');
+sesBtn.textContent = '👥 Varias cámaras';
+const sesLine = document.createElement('div');
+sesLine.className = 'ses-line';
+sesLine.hidden = true;
+
+function packMask(m) {
+  const o = new Uint8Array(Math.ceil(m.length / 4));
+  for (let i = 0; i < m.length; i++) o[i >> 2] |= m[i] << (2 * (i & 3));
+  return b64(o);
+}
+const jpegCanvas = document.createElement('canvas');
+async function jpegB64(img) {
+  jpegCanvas.width = img.width; jpegCanvas.height = img.height;
+  jpegCanvas.getContext('2d').putImageData(new ImageData(new Uint8ClampedArray(img.data), img.width, img.height), 0, 0);
+  const blob = await new Promise(r => jpegCanvas.toBlob(r, 'image/jpeg', 0.85));
+  return b64(new Uint8Array(await blob.arrayBuffer()));
+}
+
+function sesSendView(kf, img, mask, I) {
+  const s = ses;
+  sesQueue.push(async () => {
+    if (ses !== s) return;
+    const r = await api().sesionPost('/sesiones/' + s.codigo + '/vistas', {
+      camara: s.camara, id: kf.id, R: kf.R, t: kf.t, f: I.f, cx: I.cx, cy: I.cy, w: img.width, h: img.height,
+      jpg: await jpegB64(img), mask: packMask(mask)
+    });
+    kf.sesVista = r.vista;
+  });
+  sesPump();
+}
+function sesSendDepth(kf, dm) {
+  const s = ses, mm = new Uint16Array(dm.depth.length);
+  for (let i = 0; i < mm.length; i++) mm[i] = dm.depth[i] > 0 ? Math.min(65535, Math.round(dm.depth[i] * 10000)) : 0;
+  let tries = 0;
+  const job = async () => {
+    if (ses !== s) return;
+    // La profundidad va después de su vista (si la vista aún no se envía, se espera)
+    if (!kf.sesVista) { if (++tries < 40) { await sleep(500); sesQueue.push(job); } return; }
+    await api().sesionPost('/sesiones/' + s.codigo + '/vistas/' + kf.sesVista + '/profundidad', { w: dm.w, h: dm.h, f: dm.f, cx: dm.cx, cy: dm.cy, mm10: b64(mm) });
+  };
+  sesQueue.push(job);
+  sesPump();
+}
+// Envío con 2 a la vez (la red del teléfono rinde más así)
+let sesActive = 0;
+function sesPump() {
+  while (sesActive < 2 && sesQueue.length) {
+    const job = sesQueue.shift();
+    sesActive++;
+    sesSending = true;
+    job().catch(async e => { showNote('Sesión: no se pudo enviar una vista (' + e.message + ').'); await sleep(1000); })
+      .finally(() => { sesActive--; sesSending = sesActive > 0; sesPump(); });
+  }
+}
+
+async function sesStart() {
+  if (running) { alert('Únete o crea la sesión antes de iniciar la cámara.'); return; }
+  const op = prompt('Varias cámaras:\n· Escribe el CÓDIGO de 4 letras para unirte a una sesión\n· O escribe "nueva" para crear una', 'nueva');
+  if (!op) return;
+  try {
+    let codigo = op.trim().toUpperCase();
+    if (codigo === 'NUEVA') {
+      const nombre = prompt('¿Qué quieres reconocer? (ej.: rodilla, taza)', 'objeto');
+      if (nombre === null) return;
+      job.start('Creando la sesión…');
+      job.set(0.3, 'Creando la sesión (si el servidor dormía, puede tardar hasta 1 minuto)…', true);
+      codigo = (await api().sesionCrear(nombre)).codigo;
+    } else job.start('Uniéndome a la sesión ' + codigo + '…');
+    const nombreCam = (navigator.userAgent.match(/\(([^;)]+)/) || [, 'Teléfono'])[1].slice(0, 30);
+    const r = await api().sesionUnir(codigo, nombreCam);
+    ses = { codigo: r.codigo, camara: r.camara, nombre: r.nombre, version: -1 };
+    sesPts = null;
+    job.end(true, 'En la sesión ' + r.codigo + ' «' + r.nombre + '». Comparte el código con los otros teléfonos.');
+    if (!sheetMode) { sheetMode = true; try { localStorage.setItem('camara4d_modo', 'hoja'); } catch (e) { /* nada */ } paintModeBtn(); }
+    sesPaint(r);
+  } catch (e) { job.end(false, 'Sesión: ' + e.message); }
+}
+function sesLeave() {
+  ses = null; sesPts = null; sesQueue = [];
+  sesLine.hidden = true;
+  sesBtn.textContent = '👥 Varias cámaras';
+}
+function sesPaint(info) {
+  sesInfo = info;
+  sesLine.hidden = false;
+  const cams = info.camaras || [];
+  sesLine.innerHTML = '';
+  const t = document.createElement('span');
+  t.textContent = '👥 Sesión ' + info.codigo + ' «' + info.nombre + '» · ' + cams.length + ' cámara' + (cams.length === 1 ? '' : 's') + ' · ' + info.vistas + ' vistas en el servidor' + (sesQueue.length ? ' · enviando ' + sesQueue.length : '');
+  const b = document.createElement('button');
+  b.textContent = 'Salir';
+  b.onclick = () => { if (confirm('¿Salir de la sesión? (el modelo común queda en el servidor)')) sesLeave(); };
+  sesLine.append(t, b);
+  sesBtn.textContent = '👥 Sesión ' + info.codigo;
+}
+// Estado de la sesión y modelo común (cada 2,5 s)
+setInterval(async () => {
+  if (!ses) return;
+  const s = ses;
+  try {
+    const info = await api().sesion(s.codigo);
+    if (ses !== s) return;
+    sesPaint(info);
+    if (info.version !== s.version && (tab === 'res' || !running || performance.now() - (s.modelAt || 0) > 6000)) {
+      s.modelAt = performance.now();
+      const M = await api().sesionModelo(s.codigo, s.version);
+      if (ses !== s || M.sin_cambios || !M.n) { if (M.version !== undefined) s.version = M.version; return; }
+      s.version = M.version;
+      const xyz = new Float32Array(unb64(M.xyz)), rgb = new Uint8Array(unb64(M.rgb)), P = [];
+      for (let i = 0; i < M.n; i++) P.push([xyz[3 * i], xyz[3 * i + 1], xyz[3 * i + 2], rgb[3 * i], rgb[3 * i + 1], rgb[3 * i + 2]]);
+      sesPts = { P, voxel: M.voxel, medidas: M.medidas_mm, vistas: M.vistas };
+      const c = viewerCloud(P, M.voxel, true);
+      if (c) { cloud = c; viewer.setCloud(cloud); }
+      resNote.textContent = 'Modelo común de la sesión ' + s.codigo + ' «' + info.nombre + '»: ' + M.n.toLocaleString('es-CL') + ' cubitos de ' + (M.voxel * 1000).toFixed(1) + ' mm desde ' + M.vistas + ' vistas de ' + (info.camaras || []).length + ' cámara(s). Medidas: ' + M.medidas_mm.join(' × ') + ' mm.';
+    }
+  } catch (e) { sesLine.title = e.message; }
+}, 2500);
 
 /* ---------- Barra de avance (subir y unir en el servidor) ---------- */
 // Queda fija bajo el menú, así se ve desde cualquier pantalla.
@@ -1319,6 +1472,7 @@ const showTab = (() => {
   $('bNew').classList.add('big');
   $('bRoi').parentElement.classList.add('cap-sec');
   const bMode = document.createElement('button'), bPrint = document.createElement('button');
+  sesBtn.onclick = () => { if (ses) { if (confirm('¿Salir de la sesión ' + ses.codigo + '?')) sesLeave(); } else sesStart(); };
   bPrint.textContent = '🖨 Imprimir hoja';
   bPrint.onclick = () => { if (!openPrintable()) alert('El navegador bloqueó la ventana: permite ventanas emergentes para imprimir la hoja.'); };
   const paintMode = () => {
@@ -1327,13 +1481,16 @@ const showTab = (() => {
     $('bRoi').hidden = $('bRoiClr').hidden = sheetMode;
     bPrint.hidden = !sheetMode;
   };
+  paintModeBtn = paintMode;
   bMode.onclick = () => {
     if (running) { alert('Cambia el modo antes de iniciar la captura (o pulsa «Terminar»).'); return; }
+    if (ses && sheetMode) { alert('En una sesión con varias cámaras se usa la hoja (es la referencia común).'); return; }
     sheetMode = !sheetMode;
     try { localStorage.setItem('camara4d_modo', sheetMode ? 'hoja' : 'libre'); } catch (e) { /* nada */ }
     paintMode();
   };
-  $('bRoi').parentElement.prepend(bMode, bPrint);
+  $('bRoi').parentElement.prepend(bMode, bPrint, sesBtn);
+  $('bRoi').parentElement.after(sesLine);
   paintMode();
   $('fov').parentElement.parentElement.classList.add('cap-adv');
 
