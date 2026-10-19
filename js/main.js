@@ -52,7 +52,7 @@ const stat = m => { if (m !== lastMsg) { $('status').textContent = m; lastMsg = 
 
 /* ---------- Versión y textos de la página ---------- */
 // index.html es fijo: la versión, los textos y los controles nuevos los pone este archivo.
-const APP_VERSION = '9';
+const APP_VERSION = '10';
 const showErr = m => (window.showAppError ? window.showAppError(m) : stat(m));
 $('title').textContent = 'Cámara de registro · v' + APP_VERSION;
 $('help').textContent = 'La imagen 3D se arma con la profundidad de cada píxel. Un dedo gira, el pellizco (o la rueda del mouse) acerca y aleja. ' +
@@ -63,8 +63,8 @@ stat('Pulsa «Iniciar cámara» y muévete lentamente alrededor del objeto. Todo
   const bad = [];
   if (TRACKER_VERSION !== '5') bad.push('js/tracker.js');
   if (GEOMETRY_VERSION !== '5') bad.push('js/geometry.js');
-  if (DENSE_VERSION !== '7') bad.push('js/dense.js');
-  if (ASSIST_VERSION !== '1') bad.push('js/assist.js');
+  if (DENSE_VERSION !== '8') bad.push('js/dense.js');
+  if (ASSIST_VERSION !== '2') bad.push('js/assist.js');
   if (bad.length) showErr('Archivos de otra versión: ' + bad.join(', ') + '. Súbelos de nuevo.');
 }
 
@@ -331,7 +331,7 @@ function step() {
   const img = cam.ctx.getImageData(0, 0, cam.width, cam.height);
   stepCapture(img);
   // Asistente de la toma: mapa de cobertura, indicaciones y barra de detección
-  if (!finished) assist.update({ img, tracker, acc, lost, capturing: !needRef && !!acc, roi });
+  if (!finished) assist.update({ img, tracker, acc, lost, capturing: !needRef && !!acc, roi, ghost: lastGood ? lastGood.img : null });
 }
 
 function stepCapture(img) {
@@ -516,6 +516,14 @@ $('bAuto').onclick = () => {
 $('zIn').onclick = () => viewer.zoomBy(1.25);
 $('zOut').onclick = () => viewer.zoomBy(0.8);
 $('zReset').onclick = () => viewer.resetView();
+// Botón «Ver de frente» (lo crea el código; index.html no cambia)
+{
+  const b = document.createElement('button');
+  b.id = 'bFront';
+  b.textContent = 'Ver de frente';
+  b.onclick = () => viewer.frontView();
+  $('zReset').after(b);
+}
 
 $('bExp').onclick = () => exportJSON({
   cloud, poses, imu: sensors.samples,
