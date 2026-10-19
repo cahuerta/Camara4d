@@ -20,7 +20,21 @@ export class Viewer {
     requestAnimationFrame(t => this._render(t));
   }
 
-  setCloud(c) { this.cloud = c || []; }
+  // Al recibir la nube se calcula su tamaño (radio que contiene al 90 % de los puntos). Como el radio no
+  // depende del giro, el modelo queda siempre centrado y del tamaño de la pantalla, se gire como se gire.
+  setCloud(c) {
+    this.cloud = c || [];
+    if (this.cloud.length) {
+      const r = this.cloud.map(p => Math.hypot(p[0], p[1], p[2])).sort((a, b) => a - b);
+      this.radius = Math.max(0.2, r[Math.floor(r.length * 0.9)]);
+    }
+  }
+
+  // Vista de frente (como la ve la cámara)
+  frontView() {
+    this.ang = { xy: 0, xz: 0, yz: 0, xw: 0, yw: 0, zw: 0 };
+    this.zoom = 1;
+  }
   setWScale(v) { this.wScale = v; }
   setMode(m) { this.mode = m; }
   setAuto(a) { this.auto = a; }
@@ -52,7 +66,12 @@ export class Viewer {
       const dx = (e.clientX - prev.x) * 0.01, dy = (e.clientY - prev.y) * 0.01;
       this._ptr.set(e.pointerId, { x: e.clientX, y: e.clientY });
       if (this._ptr.size === 1) {
-        if (this.mode === '3d') { this.ang.xz += dx; this.ang.yz += dy; }
+        if (this.mode === '3d') {
+          // El modelo es una cara del objeto: se limita el giro a ±70° para que nunca quede de canto
+          const lim = 1.22;
+          this.ang.xz = Math.max(-lim, Math.min(lim, this.ang.xz + dx));
+          this.ang.yz = Math.max(-lim, Math.min(lim, this.ang.yz + dy));
+        }
         else { this.ang.xw += dx; this.ang.yw += dy; }
       } else if (this._ptr.size === 2) {
         const d = this._pinchDist();
@@ -99,7 +118,8 @@ export class Viewer {
     if (this.auto) { this.ang.xw += 0.4 * dt; this.ang.zw += 0.25 * dt; this.ang.xy += 0.1 * dt; }
 
     const ctx = this.ctx, W = this.c.width, H = this.c.height, d = window.devicePixelRatio || 1;
-    const sc = Math.min(W, H) * 0.26 * this.zoom;
+    // Encuadre automático: el 90 % del modelo ocupa algo menos de la mitad del lado menor
+    const sc = Math.min(W, H) * 0.42 / (this.radius || 1.6) * this.zoom;
     ctx.clearRect(0, 0, W, H);
 
     // Ejes: X rojo, Y verde, Z azul, W blanco
@@ -136,4 +156,4 @@ export class Viewer {
     }
     requestAnimationFrame(t => this._render(t));
   }
-}
+                 }
