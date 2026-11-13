@@ -102,7 +102,7 @@ const med = a => { if (!a.length) return 0; const q = a.slice().sort((x, y) => x
 
 /* ---------- Versión y textos de la página ---------- */
 // index.html es fijo: la versión, los textos y los controles nuevos los pone este archivo.
-const APP_VERSION = '21';
+const APP_VERSION = '22';
 const showErr = m => (window.showAppError ? window.showAppError(m) : stat(m));
 $('title').innerHTML = 'Cámara 4D <span>v' + APP_VERSION + '</span>';
 $('help').textContent = 'El modelo 3D se arma con la profundidad de cada píxel y crece con cada vista. Un dedo gira, el pellizco (o la rueda del mouse) acerca y aleja. ' +
@@ -117,7 +117,7 @@ stat('Pulsa «Iniciar cámara» y gira alrededor del objeto. Todo se suma a un s
   if (MODEL_VERSION !== '5') bad.push('js/fragments.js');
   if (HOJA_VERSION !== '1') bad.push('js/hoja.js');
   if (VOL_VERSION !== '1') bad.push('js/volumen.js');
-  if (CUERPO_VERSION !== '1') bad.push('js/cuerpo.js');
+  if (CUERPO_VERSION !== '2') bad.push('js/cuerpo.js');
   if (bad.length) showErr('Archivos de otra versión: ' + bad.join(', ') + '. Súbelos de nuevo.');
 }
 
