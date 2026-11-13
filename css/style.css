@@ -103,7 +103,15 @@ body.app .tomas{border:0;padding:0;background:transparent}
 .ses-line{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:8px;padding:8px 10px;border:1px solid #1f5e3c;background:#0f1f17;color:#3ddc84;border-radius:10px;font-size:13px}
 .ses-line[hidden]{display:none}
 .ses-line button{padding:6px 10px;font-size:13px}
-/* Pantalla Cuerpo (v22, cuerpo.js): reconocimiento del segmento con nuestra red */
+/* Pantalla de la cámara (v23, cuerpo.js) */
+.vid.cu-vid canvas{pointer-events:auto;touch-action:manipulation}
+.cu-det{margin-top:8px;padding:10px;border:1px solid var(--ac);border-radius:10px;background:#10141c;font-size:13px;display:grid;gap:6px}
+.cu-det[hidden]{display:none}
+.cu-t{font-weight:700;font-size:15px}
+.cu-p{color:#f7c948;font-weight:600}
+.cu-l{color:var(--mut)}
+.cu-ens{margin-top:12px;padding:10px;border:1px dashed var(--mut);border-radius:10px;display:grid;gap:6px}
+.cu-ens select{padding:6px;border-radius:8px;background:#10141c;color:var(--tx);border:1px solid var(--mut)}
 .cu-msg{font-size:14px;color:var(--tx);opacity:.85;margin-top:8px;min-height:20px}
 .cu-msg:empty{display:none}
 .cu-res{margin-top:10px;padding:12px;border:1px solid var(--ac);border-radius:12px;background:#10141c;text-align:center}
