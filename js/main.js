@@ -18,6 +18,7 @@ import { detectMarkers, correspondences, poseFromHomography, reprojError, FocalC
 import { Viewer } from './viewer.js';
 import { exportJSON } from './export.js';
 import { Assist, VERSION as ASSIST_VERSION } from './assist.js';
+import { crearCuerpo, VERSION as CUERPO_VERSION } from './cuerpo.js';
 import { Model, camCenter, toWorld, localTomas, serverApi, alignModels, movePose, b64, unb64, VERSION as MODEL_VERSION } from './fragments.js';
 
 const $ = id => document.getElementById(id);
@@ -84,9 +85,8 @@ let lastMsg = '';
 // a unir en el teléfono se unen al terminar, o en el servidor.
 let parts = [];                      // tramos anteriores sin unir: { model, kfList, roiObject }
 
-// MODO HOJA: la hoja impresa da la posición exacta de la cámara y las medidas reales (metros)
-let sheetMode = true;
-try { sheetMode = localStorage.getItem('camara4d_modo') !== 'libre'; } catch (e) { /* nada */ }
+// Sin hoja impresa (v21): la captura es siempre libre. El código de la hoja queda apagado.
+const sheetMode = false;
 let sheetCal = null, sheetDets = [], sheetSeen = 0;
 let vol = null, volPts = null, volAt = 0;   // capas: forma → relieve → color
 let sectors = new Set();                    // lados ya vistos alrededor de la hoja (12 de 30°)
@@ -102,7 +102,7 @@ const med = a => { if (!a.length) return 0; const q = a.slice().sort((x, y) => x
 
 /* ---------- Versión y textos de la página ---------- */
 // index.html es fijo: la versión, los textos y los controles nuevos los pone este archivo.
-const APP_VERSION = '20';
+const APP_VERSION = '21';
 const showErr = m => (window.showAppError ? window.showAppError(m) : stat(m));
 $('title').innerHTML = 'Cámara 4D <span>v' + APP_VERSION + '</span>';
 $('help').textContent = 'El modelo 3D se arma con la profundidad de cada píxel y crece con cada vista. Un dedo gira, el pellizco (o la rueda del mouse) acerca y aleja. ' +
@@ -117,6 +117,7 @@ stat('Pulsa «Iniciar cámara» y gira alrededor del objeto. Todo se suma a un s
   if (MODEL_VERSION !== '5') bad.push('js/fragments.js');
   if (HOJA_VERSION !== '1') bad.push('js/hoja.js');
   if (VOL_VERSION !== '1') bad.push('js/volumen.js');
+  if (CUERPO_VERSION !== '1') bad.push('js/cuerpo.js');
   if (bad.length) showErr('Archivos de otra versión: ' + bad.join(', ') + '. Súbelos de nuevo.');
 }
 
@@ -1069,7 +1070,6 @@ async function sesStart() {
     ses = { codigo: r.codigo, camara: r.camara, nombre: r.nombre, version: -1 };
     sesPts = null;
     job.end(true, 'En la sesión ' + r.codigo + ' «' + r.nombre + '». Comparte el código con los otros teléfonos.');
-    if (!sheetMode) { sheetMode = true; try { localStorage.setItem('camara4d_modo', 'hoja'); } catch (e) { /* nada */ } paintModeBtn(); }
     sesPaint(r);
   } catch (e) { job.end(false, 'Sesión: ' + e.message); }
 }
@@ -1449,7 +1449,7 @@ $('bExp').onclick = () => exportJSON({
   extra: { toma: lastToma || (model.voxels ? model.toToma({ id: 'sin-guardar', nombre: 'Captura en curso', fecha: new Date().toISOString(), intr }) : null) }
 });
 
-/* ---------- Pantalla tipo app: menú arriba con 3 pantallas ---------- */
+/* ---------- Pantalla tipo app: menú arriba con 4 pantallas ---------- */
 // index.html no cambia: aquí se reordenan sus partes en pestañas.
 //   📷 Captura  → cámara, botón grande Iniciar / Terminar, asistente y avance
 //   🧊 Resultado → el modelo 3D a pantalla completa, sus controles y exportar
@@ -1468,7 +1468,7 @@ const showTab = (() => {
   top.className = 'top';
   const nav = document.createElement('nav');
   nav.className = 'tabs';
-  const tabs = [['cap', '📷', 'Captura'], ['res', '🧊', 'Resultado'], ['tomas', '☁', 'Tomas']];
+  const tabs = [['cap', '📷', 'Captura'], ['cuerpo', '🧍', 'Cuerpo'], ['res', '🧊', 'Resultado'], ['tomas', '☁', 'Tomas']];
   const btn = {};
   for (const [id, ic, txt] of tabs) {
     const b = document.createElement('button');
@@ -1491,27 +1491,8 @@ const showTab = (() => {
   $('bEnd').classList.add('big', 'stop');
   $('bNew').classList.add('big');
   $('bRoi').parentElement.classList.add('cap-sec');
-  const bMode = document.createElement('button'), bPrint = document.createElement('button');
-  sesBtn.onclick = () => { if (ses) { if (confirm('¿Salir de la sesión ' + ses.codigo + '?')) sesLeave(); } else sesStart(); };
-  bPrint.textContent = '🖨 Imprimir hoja';
-  bPrint.onclick = () => { if (!openPrintable()) alert('El navegador bloqueó la ventana: permite ventanas emergentes para imprimir la hoja.'); };
-  const paintMode = () => {
-    bMode.textContent = sheetMode ? '📄 Con hoja (medidas reales)' : '🔓 Sin hoja';
-    bMode.classList.toggle('on', sheetMode);
-    $('bRoi').hidden = $('bRoiClr').hidden = sheetMode;
-    bPrint.hidden = !sheetMode;
-  };
-  paintModeBtn = paintMode;
-  bMode.onclick = () => {
-    if (running) { alert('Cambia el modo antes de iniciar la captura (o pulsa «Terminar»).'); return; }
-    if (ses && sheetMode) { alert('En una sesión con varias cámaras se usa la hoja (es la referencia común).'); return; }
-    sheetMode = !sheetMode;
-    try { localStorage.setItem('camara4d_modo', sheetMode ? 'hoja' : 'libre'); } catch (e) { /* nada */ }
-    paintMode();
-  };
-  $('bRoi').parentElement.prepend(bMode, bPrint, sesBtn);
+  // Sin hoja: ya no se ofrece imprimir hoja ni el modo con hoja (ni varias cámaras, que dependía de la hoja)
   $('bRoi').parentElement.after(sesLine);
-  paintMode();
   $('fov').parentElement.parentElement.classList.add('cap-adv');
 
   // Pantalla Resultado
@@ -1544,10 +1525,15 @@ const showTab = (() => {
   pTom.appendChild(tBox);
   pRes.after(pTom);
 
+  // Pantalla Cuerpo (cuerpo.js): reconoce el cuerpo y le superpone el atlas por segmento
+  const cuerpo = crearCuerpo({ ocupado: () => running });
+  pCap.after(cuerpo.page);
+
   // Lo que quedó en la caja de captura y no se usa ahí (exportar ya está en Resultado)
-  const pages = { cap: pCap, res: pRes, tomas: pTom };
+  const pages = { cap: pCap, cuerpo: cuerpo.page, res: pRes, tomas: pTom };
   function show(id) {
     tab = id;
+    if (id !== 'cuerpo' && cuerpo.activo) cuerpo.detener();
     for (const k in pages) { pages[k].hidden = k !== id; btn[k].classList.toggle('on', k === id); }
     tomasPanel.open = id === 'tomas';
     if (id === 'res') requestAnimationFrame(() => viewer.fit());
