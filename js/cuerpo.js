@@ -10,10 +10,11 @@ import { Red } from './red.js';
 import { Atlas3D, THREE } from './atlas3d.js';
 const THREE_V = (x, y, z) => new THREE.Vector3(x, y, z);
 
-export const VERSION = '4';
+export const VERSION = '5';
 
 const MP = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
 const MOD_POSE = 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task';
+const MOD_SEG = 'https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/latest/selfie_multiclass_256x256.tflite';
 const MOD_MANO = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
 
 // Segmentos (salvo la mano): puntos de MediaPipe Pose (derecho, izquierdo) y articulaciones del atlas
@@ -33,6 +34,32 @@ const ARTIC = { hombro: 'hombro', codo: 'codo', muneca: 'muñeca', nudillos: 'nu
 const el = (t, cls, txt) => { const e = document.createElement(t); if (cls) e.className = cls; if (txt != null) e.textContent = txt; return e; };
 const sub = (a, b) => [a[0] - b[0], a[1] - b[1]];
 const len = v => Math.hypot(v[0], v[1]);
+
+// Silueta de la piel (máscara w × h) → eje del segmento en píxeles del video (W × H).
+// Centro y dirección por componentes principales; el extremo más ancho se toma como proximal
+// (muslo, pierna, brazo, antebrazo; en el pie es al revés). Devuelve null si hay poca piel.
+export function ajustarSilueta(mask, w, h, W, H, esPiel) {
+  const sx = W / w, sy = H / h;
+  let n = 0, mx = 0, my = 0;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (esPiel(mask[y * w + x])) { n++; mx += x; my += y; }
+  if (n < 0.04 * w * h) return null;
+  mx = mx / n * sx; my = my / n * sy;
+  let cxx = 0, cyy = 0, cxy = 0;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (esPiel(mask[y * w + x])) {
+    const dx = x * sx - mx, dy = y * sy - my; cxx += dx * dx; cyy += dy * dy; cxy += dx * dy;
+  }
+  const ang = 0.5 * Math.atan2(2 * cxy, cxx - cyy), u = [Math.cos(ang), Math.sin(ang)], v = [-u[1], u[0]];
+  // Largo y ancho: percentiles a lo largo y a lo ancho del eje
+  const ts = [], ss = [];
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) if (esPiel(mask[y * w + x])) {
+    const dx = x * sx - mx, dy = y * sy - my; ts.push(dx * u[0] + dy * u[1]); ss.push([dx * u[0] + dy * u[1], dx * v[0] + dy * v[1]]);
+  }
+  const ord = ts.slice().sort((a, b) => a - b), t0 = ord[Math.floor(n * 0.05)], t1 = ord[Math.floor(n * 0.95)];
+  const anchoEn = (ta, tb) => { const xs = ss.filter(p => p[0] >= ta && p[0] <= tb).map(p => p[1]).sort((a, b) => a - b); return xs.length > 20 ? xs[Math.floor(xs.length * 0.95)] - xs[Math.floor(xs.length * 0.05)] : 0; };
+  const L = t1 - t0, ancho = anchoEn(t0 + 0.3 * L, t0 + 0.7 * L);
+  const wa = anchoEn(t0, t0 + 0.2 * L), wb = anchoEn(t1 - 0.2 * L, t1);
+  return { centro: [mx, my], u, ancho, anchoInicio: wa, anchoFin: wb };
+}
 
 /* ---------- Fotos reales para reentrenar nuestra red (se guardan en el teléfono) ---------- */
 const BD = { db: null };
@@ -60,8 +87,9 @@ export function crearCuerpo() {
   const bIni = el('button', 'pri big', 'Iniciar cámara');
   const bCapa = el('button', 'on', 'Capa: músculo');
   const bPausa = el('button', '', '⏸ Pausar');
+  const bSeg = el('button', '', 'De cerca: automático');
   const r1 = el('div', 'row cap-main'); r1.append(bIni);
-  const r2 = el('div', 'row cap-sec'); r2.append(bCapa, bPausa);
+  const r2 = el('div', 'row cap-sec'); r2.append(bCapa, bSeg, bPausa);
   const res = el('div', 'cu-res'); const resN = el('div', 'cu-n', '—'), resO = el('div', 'cu-o', ''); res.append(resN, resO);
   const det = el('div', 'cu-det'); det.hidden = true;
   // Enseñar a nuestra red
@@ -81,6 +109,7 @@ export function crearCuerpo() {
 
   let atlas = null, pose = null, mano = null, stream = null, activo = false, pausa = false;
   let capa = 'musculo', lastT = -1, actual = null, cuadro = 0, suave = null;
+  let segm = null, segmCargando = false, eleccion = null;   // de cerca: silueta de la piel; eleccion = segmento elegido a mano
   const red = new Red(); let redOk = false, redProb = null;
   const peq = document.createElement('canvas'); const pctx = peq.getContext('2d', { willReadFrequently: true });
 
@@ -105,6 +134,19 @@ export function crearCuerpo() {
       crea(HandLandmarker, MOD_MANO, { numHands: 1, minHandDetectionConfidence: 0.5, minHandPresenceConfidence: 0.5, minTrackingConfidence: 0.5 })]);
   }
 
+  // El modelo de silueta se carga aparte, sin hacer esperar (solo se usa de cerca)
+  async function cargarSilueta() {
+    if (segm || segmCargando) return;
+    segmCargando = true;
+    try {
+      const { FilesetResolver, ImageSegmenter } = await import(MP + '/vision_bundle.mjs');
+      const fs = await FilesetResolver.forVisionTasks(MP + '/wasm');
+      const o = d => ({ baseOptions: { modelAssetPath: MOD_SEG, delegate: d }, runningMode: 'VIDEO', outputCategoryMask: true, outputConfidenceMasks: false });
+      try { segm = await ImageSegmenter.createFromOptions(fs, o('GPU')); } catch (e) { segm = await ImageSegmenter.createFromOptions(fs, o('CPU')); }
+    } catch (e) { msg.textContent = 'No se pudo cargar el reconocimiento de cerca: ' + e.message; }
+    segmCargando = false;
+  }
+
   async function iniciar() {
     bIni.disabled = true;
     try {
@@ -118,6 +160,7 @@ export function crearCuerpo() {
       activo = true; pausa = false; lastT = -1; actual = null;
       bIni.textContent = '⏹ Detener'; bIni.classList.add('stop'); bIni.disabled = false;
       msg.textContent = '';
+      cargarSilueta();
       requestAnimationFrame(bucle);
     } catch (e) {
       bIni.disabled = false;
@@ -173,7 +216,7 @@ export function crearCuerpo() {
     }
     // 2) Otros segmentos: el más grande que se vea entero (sus dos extremos dentro de la imagen)
     const rp = pose.detectForVideo(video, t);
-    if (!(rp.landmarks && rp.landmarks[0] && rp.worldLandmarks && rp.worldLandmarks[0])) { actual = null; suave = null; atlas.ocultar(); return; }
+    if (!(rp.landmarks && rp.landmarks[0] && rp.worldLandmarks && rp.worldLandmarks[0])) { suave = null; deCerca(t); return; }
     const [m, L] = suavizar('pose', rp.worldLandmarks[0], rp.landmarks[0]);
     const ve = i => (L[i].visibility == null || L[i].visibility > 0.65) && L[i].x > 0.01 && L[i].x < 0.99 && L[i].y > 0.01 && L[i].y < 0.99;
     let mejor = null;
@@ -184,7 +227,7 @@ export function crearCuerpo() {
       if (l < 0.12 * Math.min(W, H)) continue;   // muy chico: no es el segmento que se está mirando
       if (!mejor || l > mejor.l) mejor = { seg, lado, l, ia, ib };
     }
-    if (!mejor) { actual = null; atlas.ocultar(); return; }
+    if (!mejor) { deCerca(t); return; }
     const C = atlas.aCamara(m, L, [mejor.ia, mejor.ib]);
     if (!C) { actual = null; atlas.ocultar(); return; }
     const { seg, lado } = mejor, P = k => C[LM[k][lado]], S = SEG[seg];
@@ -213,9 +256,46 @@ export function crearCuerpo() {
     if (!ok) atlas.ocultar();
   }
 
-  const nombreDe = (seg, lado) => SEG[seg].nombre + ' ' + (lado ? (SEG[seg].fem ? 'izquierda' : 'izquierdo') : (SEG[seg].fem ? 'derecha' : 'derecho'));
+  // De cerca (no se ve el cuerpo): silueta de la piel + segmento elegido a mano o el que dice nuestra red
+  const SEG_RED = { antebrazo: 'Antebrazo', brazo: 'Brazo', muslo: 'Muslo', pierna: 'Pierna', pie: 'Pie' };
+  function segmentoDeLaRed() {
+    if (!redProb) return null;
+    let mejor = null;
+    for (const seg in SEG_RED) for (const lado of [0, 1]) {
+      const i = red.nombres.findIndex(n => n.startsWith(SEG_RED[seg] + ' ') && (lado ? /izquierd/.test(n) : /derech/.test(n)));
+      if (i >= 0 && (!mejor || redProb[i] > mejor.p)) mejor = { seg, lado, p: redProb[i] };
+    }
+    return mejor && mejor.p > 0.5 ? mejor : null;
+  }
+  function deCerca(t) {
+    const elegido = eleccion ? { seg: eleccion, lado: null } : segmentoDeLaRed();
+    if ((!segm && !window.__mascaraPrueba) || !elegido) { actual = null; atlas.ocultar(); if (!elegido) actual = { sinSegmento: true }; return; }
+    let fit = null;
+    const W = video.videoWidth, H = video.videoHeight;
+    const prueba = window.__mascaraPrueba;   // solo para pruebas automáticas
+    const usar = (arr, w, h) => {
+      // 2 = piel del cuerpo; si casi no hay piel (con ropa), también la ropa (4)
+      let piel = 0; for (let i = 0; i < arr.length; i++) if (arr[i] === 2) piel++;
+      const esPiel = piel > 0.04 * arr.length ? c => c === 2 : c => c === 2 || c === 4;
+      fit = ajustarSilueta(arr, w, h, W, H, esPiel);
+    };
+    if (prueba) { const m = prueba(); usar(m.arr, m.w, m.h); }
+    else segm.segmentForVideo(video, t, r => { const m = r.categoryMask; if (m) usar(m.getAsUint8Array(), m.width, m.height); });
+    if (!fit) { actual = null; atlas.ocultar(); return; }
+    const S = SEG[elegido.seg];
+    // El extremo más ancho es el proximal (en el pie, el más angosto: el tobillo)
+    let u = fit.u, cerca = fit.anchoInicio >= fit.anchoFin;
+    if (elegido.seg === 'pie') cerca = !cerca;
+    if (!cerca) u = [-u[0], -u[1]];
+    const ok = atlas.silueta(elegido.seg, elegido.lado === 1, fit.centro, u, fit.ancho, S.art[0], S.art[1]);
+    actual = ok ? { seg: elegido.seg, lado: elegido.lado, deCerca: true } : null;
+    if (!ok) atlas.ocultar();
+  }
+
+  const nombreDe = (seg, lado) => SEG[seg].nombre + (lado == null ? '' : ' ' + (lado ? (SEG[seg].fem ? 'izquierda' : 'izquierdo') : (SEG[seg].fem ? 'derecha' : 'derecho')));
   function mostrarResultado() {
-    resN.textContent = actual ? nombreDe(actual.seg, actual.lado) + (actual.vista ? ' · ' + actual.vista : '') : 'Buscando un segmento…';
+    if (actual && actual.sinSegmento) resN.textContent = 'De cerca: elige el segmento con el botón «De cerca»';
+    else resN.textContent = actual ? nombreDe(actual.seg, actual.lado) + (actual.vista ? ' · ' + actual.vista : '') + (actual.deCerca ? ' · de cerca (vista de frente)' : '') : 'Buscando un segmento…';
     if (redProb) {
       const i = redProb.indexOf(Math.max(...redProb));
       resO.textContent = 'Nuestra red (aprendiendo): ' + red.nombres[i] + ' ' + Math.round(redProb[i] * 100) + '%';
@@ -224,7 +304,7 @@ export function crearCuerpo() {
 
   /* ---------- Tocar: qué estructura hay bajo el dedo ---------- */
   ov.addEventListener('pointerdown', e => {
-    if (!atlas || !actual) return;
+    if (!atlas || !actual || !actual.seg) return;
     const r = ov.getBoundingClientRect();
     const x = (e.clientX - r.left) / r.width * atlas.W, y = (e.clientY - r.top) / r.height * atlas.H;
     const parte = atlas.tocar(x, y);
@@ -279,6 +359,12 @@ export function crearCuerpo() {
     capa = capa === 'musculo' ? 'hueso' : 'musculo';
     bCapa.textContent = 'Capa: ' + (capa === 'musculo' ? 'músculo' : 'hueso');
     if (atlas) { atlas.ponerCapa(capa); if (actual) atlas.pintar(); }
+  };
+  const ORDEN_SEG = [null, 'antebrazo', 'brazo', 'muslo', 'pierna', 'pie'];
+  bSeg.onclick = () => {
+    eleccion = ORDEN_SEG[(ORDEN_SEG.indexOf(eleccion) + 1) % ORDEN_SEG.length];
+    bSeg.textContent = 'De cerca: ' + (eleccion ? SEG[eleccion].nombre.toLowerCase() : 'automático');
+    bSeg.classList.toggle('on', !!eleccion);
   };
   bPausa.onclick = () => {
     pausa = !pausa; bPausa.textContent = pausa ? '▶ Seguir' : '⏸ Pausar';

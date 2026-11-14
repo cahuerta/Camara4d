@@ -8,7 +8,7 @@
 
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.147.0/build/three.module.js';
 
-export const VERSION = '1';
+export const VERSION = '2';
 const BASE = 'img/atlas3d/';
 
 const v3 = a => new THREE.Vector3(a[0], a[1], a[2]);
@@ -151,6 +151,46 @@ export class Atlas3D {
     const R = Fv.multiply(Fa.transpose());
     const k = pa.distanceTo(pb) / A.distanceTo(B);
     const mt = colocar(pa, R, k, A, izq);
+    for (const m of s.mallas) m.matrix.copy(mt);
+    this.actual = { seg, izq };
+    this.pintar();
+    return true;
+  }
+  // Ancho del segmento visto de frente (lado a lado), en el atlas: para ajustar la escala a la silueta
+  anchoDe(seg, aName, bName) {
+    const s = this.segs[seg];
+    if (s.ancho) return s.ancho;
+    const A = s.art[aName], B = s.art[bName], F = base(A, B, new THREE.Vector3(0, 0, 1));
+    const u = new THREE.Vector3(), v = new THREE.Vector3(), w = new THREE.Vector3(); F.extractBasis(u, v, w);
+    const L = A.distanceTo(B), xs = [], p = new THREE.Vector3();
+    s.mallas.forEach((m, i) => {
+      if (s.info.partes[i].tipo !== 'musculo') return;
+      const pos = m.geometry.attributes.position;
+      for (let k = 0; k < pos.count; k += 3) {
+        p.fromBufferAttribute(pos, k).sub(A);
+        const t = p.dot(u) / L; if (t < 0.2 || t > 0.8) continue;
+        xs.push(p.dot(w));
+      }
+    });
+    xs.sort((a, b) => a - b);
+    s.ancho = xs.length ? xs[Math.floor(xs.length * 0.95)] - xs[Math.floor(xs.length * 0.05)] : L * 0.3;
+    return s.ancho;
+  }
+  // De cerca, sin puntos del cuerpo: el segmento se pone sobre la silueta de la piel (centro, dirección y ancho en píxeles).
+  // Se supone visto de frente; la escala sale del ancho de la silueta.
+  silueta(seg, izq, centro, dir, anchoPx, aName, bName) {
+    const s = this.segs[seg]; this.solo(s);
+    const Z = 0.6, f = this.f;
+    const E = n => espejo(s.art[n], izq);
+    const A = E(aName), B = E(bName);
+    const Fa = base(A, B, new THREE.Vector3(0, 0, 1));
+    const u = new THREE.Vector3(dir[0], -dir[1], 0).normalize();
+    const Fv = base(new THREE.Vector3(), u, new THREE.Vector3(0, 0, 1));
+    if (!Fa || !Fv) return false;
+    const R = Fv.multiply(Fa.transpose());
+    const k = (anchoPx * Z / f) / this.anchoDe(seg, aName, bName);
+    const pc = new THREE.Vector3((centro[0] - this.W / 2) / f * Z, -(centro[1] - this.H / 2) / f * Z, -Z);
+    const mt = colocar(pc, R, k, A.clone().add(B).multiplyScalar(0.5), izq);
     for (const m of s.mallas) m.matrix.copy(mt);
     this.actual = { seg, izq };
     this.pintar();
