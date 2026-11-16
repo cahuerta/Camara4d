@@ -116,5 +116,5 @@ body.app .tomas{border:0;padding:0;background:transparent}
 .cu-msg:empty{display:none}
 .cu-res{margin-top:10px;padding:12px;border:1px solid var(--ac);border-radius:12px;background:#10141c;text-align:center}
 .cu-res[hidden]{display:none}
-.cu-n{font-size:24px;font-weight:700}
+.cu-n{font-size:22px;font-weight:700;text-wrap:balance}
 .cu-o{font-size:12px;color:var(--mut);margin-top:4px}

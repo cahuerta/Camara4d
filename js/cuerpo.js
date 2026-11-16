@@ -10,7 +10,7 @@ import { Red } from './red.js';
 import { Atlas3D, THREE } from './atlas3d.js';
 const THREE_V = (x, y, z) => new THREE.Vector3(x, y, z);
 
-export const VERSION = '6';
+export const VERSION = '7';
 
 const MP = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
 const MOD_POSE = 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task';
@@ -118,7 +118,8 @@ export function crearCuerpo() {
 
   let atlas = null, pose = null, mano = null, stream = null, activo = false, pausa = false;
   let capa = 'musculo', lastT = -1, actual = null, cuadro = 0, suave = null;
-  let segm = null, segmCargando = false, eleccion = null;   // de cerca: silueta de la piel; eleccion = segmento elegido a mano
+  let lejos = null;   // último resultado con el cuerpo a la vista (se mantiene un momento si MediaPipe lo pierde)
+  let segm = null, segmCargando = false, segmError = '', eleccion = null, ultima = null;   // ultima: lo último reconocido de lejos (se sigue usando al acercarse)   // de cerca: silueta de la piel; eleccion = segmento elegido a mano
   const red = new Red(); let redOk = false, redProb = null;
   const peq = document.createElement('canvas'); const pctx = peq.getContext('2d', { willReadFrequently: true });
 
@@ -152,7 +153,7 @@ export function crearCuerpo() {
       const fs = await FilesetResolver.forVisionTasks(MP + '/wasm');
       const o = d => ({ baseOptions: { modelAssetPath: MOD_SEG, delegate: d }, runningMode: 'VIDEO', outputCategoryMask: true, outputConfidenceMasks: false });
       try { segm = await ImageSegmenter.createFromOptions(fs, o('GPU')); } catch (e) { segm = await ImageSegmenter.createFromOptions(fs, o('CPU')); }
-    } catch (e) { msg.textContent = 'No se pudo cargar el reconocimiento de cerca: ' + e.message; }
+    } catch (e) { segmError = e.message || String(e); }
     segmCargando = false;
   }
 
@@ -226,7 +227,9 @@ export function crearCuerpo() {
     }
     // 2) Con el cuerpo a la vista (MediaPipe Pose): lo que está al centro de la imagen, segmento o articulación
     const rp = pose.detectForVideo(video, t);
-    if (!(rp.landmarks && rp.landmarks[0] && rp.worldLandmarks && rp.worldLandmarks[0])) { suave = null; deCerca(t); return; }
+    // Si se pierde el cuerpo por un instante, se mantiene lo último (no salta a «de cerca»)
+    const mantener = () => { if (lejos && t - lejos.t < 800) { lejos.a.piezas.forEach(pz => atlas.mostrar(pz)); actual = lejos.a; return true; } return false; };
+    if (!(rp.landmarks && rp.landmarks[0] && rp.worldLandmarks && rp.worldLandmarks[0])) { if (mantener()) return; suave = null; deCerca(t); return; }
     const [m, L] = suavizar('pose', rp.worldLandmarks[0], rp.landmarks[0]);
     const dentro = i => L[i].x > 0.01 && L[i].x < 0.99 && L[i].y > 0.01 && L[i].y < 0.99;
     const ve = i => (L[i].visibility == null || L[i].visibility > 0.6) && dentro(i);
@@ -252,7 +255,15 @@ export function crearCuerpo() {
       const d = dSeg(c, px(LM[SEG[seg].a][lado]), px(LM[SEG[seg].b][lado]));
       if (!foco || d < foco.d) foco = { zona: seg, lado, d, piezas: [seg] };
     }
-    if (!foco) { deCerca(t); return; }
+    // No cambiar de foco por poco: se mantiene el anterior si sigue casi igual de cerca del centro
+    if (foco && lejos && (lejos.a.zona !== foco.zona || lejos.a.lado !== foco.lado) && t - lejos.t < 800) {
+      const prev = lejos.a, esArt = !!ART[prev.zona];
+      let dPrev = Infinity, piezasPrev = null;
+      if (esArt && ve(LM[prev.zona][prev.lado])) { dPrev = len(sub(px(LM[prev.zona][prev.lado]), c)); piezasPrev = ART[prev.zona].piezas.filter(pz => puede(pz, prev.lado)); }
+      else if (!esArt && puede(prev.zona, prev.lado)) { dPrev = dSeg(c, px(LM[SEG[prev.zona].a][prev.lado]), px(LM[SEG[prev.zona].b][prev.lado])); piezasPrev = [prev.zona]; }
+      if (piezasPrev && piezasPrev.length && dPrev < foco.d * 1.4 + 0.03 * D) foco = { zona: prev.zona, lado: prev.lado, d: dPrev, piezas: piezasPrev };
+    }
+    if (!foco) { if (mantener()) return; deCerca(t); return; }
     // Profundidad con los extremos de las piezas que se dibujan
     const ancla = new Set();
     for (const pz of foco.piezas) {
@@ -264,6 +275,7 @@ export function crearCuerpo() {
     if (!C) { actual = null; return; }
     const hechas = foco.piezas.filter(pz => colocarPieza(pz, foco.lado, C, L));
     actual = hechas.length ? { zona: foco.zona, lado: foco.lado, piezas: hechas } : null;
+    if (actual) { ultima = { zona: foco.zona, lado: foco.lado, t: performance.now() }; lejos = { a: actual, t }; }
   }
 
   // Pone una pieza con su giro. C: puntos en la cámara; L: puntos en la imagen (para saber qué se ve)
@@ -309,9 +321,18 @@ export function crearCuerpo() {
     return mejor && mejor.p > 0.5 ? mejor : null;
   }
   function deCerca(t) {
-    const elegido = eleccion ? { zona: eleccion, lado: null } : zonaDeLaRed();
-    if (!elegido) { actual = { sinZona: true }; return; }
-    if (!segm && !window.__mascaraPrueba) { actual = null; return; }
+    // Qué es: lo elegido a mano; si no, lo último reconocido de lejos (al acercarse); si no, nuestra red
+    const DE_CERCA = { hombro: 'brazo', cadera: 'muslo' };
+    let elegido = null;
+    if (eleccion) elegido = { zona: eleccion, lado: null };
+    else if (ultima && performance.now() - ultima.t < 120000) elegido = { zona: DE_CERCA[ultima.zona] || ultima.zona, lado: ultima.lado };
+    else elegido = zonaDeLaRed();
+    if (!elegido) { actual = { aviso: 'De cerca: aléjate un poco para que reconozca el segmento y luego acércate, o elige qué es con «De cerca».' }; return; }
+    if (!segm && !window.__mascaraPrueba) {
+      actual = { aviso: segmError ? 'No se pudo cargar el reconocimiento de cerca: ' + segmError : 'Cargando el reconocimiento de cerca…' };
+      if (!segmError) cargarSilueta();
+      return;
+    }
     let fit = null;
     const W = video.videoWidth, H = video.videoHeight;
     const prueba = window.__mascaraPrueba;   // solo para pruebas automáticas
@@ -323,7 +344,7 @@ export function crearCuerpo() {
     };
     if (prueba) { const m = prueba(); usar(m.arr, m.w, m.h); }
     else segm.segmentForVideo(video, t, r => { const m = r.categoryMask; if (m) usar(m.getAsUint8Array(), m.width, m.height); });
-    if (!fit) { actual = null; return; }
+    if (!fit) { actual = { aviso: 'De cerca: no distingo la piel. Prueba con más luz o con la piel descubierta.' }; return; }
     // El extremo más ancho es el proximal (en el pie, el más angosto: el tobillo)
     let u = fit.u, cerca = fit.anchoInicio >= fit.anchoFin;
     if (elegido.zona === 'pie') cerca = !cerca;
@@ -345,7 +366,7 @@ export function crearCuerpo() {
 
   const nombreDe = (zona, lado) => { const Z = ZONA(zona); return Z.nombre + (lado == null ? '' : ' ' + (lado ? (Z.fem ? 'izquierda' : 'izquierdo') : (Z.fem ? 'derecha' : 'derecho'))); };
   function mostrarResultado() {
-    if (actual && actual.sinZona) resN.textContent = 'De cerca: elige qué es con el botón «De cerca»';
+    if (actual && actual.aviso) resN.textContent = actual.aviso;
     else resN.textContent = actual ? nombreDe(actual.zona, actual.lado) + (actual.vista ? ' · ' + actual.vista : '') + (actual.deCerca ? ' · de cerca (vista de frente)' : '') : 'Buscando un segmento…';
     if (redProb) {
       const i = redProb.indexOf(Math.max(...redProb));
