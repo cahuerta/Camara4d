@@ -9,7 +9,7 @@
 import { Atlas3D, THREE } from './atlas3d.js';
 const THREE_V = (x, y, z) => new THREE.Vector3(x, y, z);
 
-export const VERSION = '8';
+export const VERSION = '9';
 
 const MP = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
 const MOD_POSE = 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task';
@@ -40,6 +40,18 @@ const ARTIC = { hombro: 'hombro', codo: 'codo', muneca: 'muñeca', nudillos: 'nu
   cadera: 'cadera', rodilla: 'rodilla', tobillo: 'tobillo', dedo_pie: 'dedos del pie' };
 
 const el = (t, cls, txt) => { const e = document.createElement(t); if (cls) e.className = cls; if (txt != null) e.textContent = txt; return e; };
+// Filtro «One Euro»: quita el temblor cuando la mano está quieta y no se atrasa cuando se mueve rápido
+class Filtro1E {
+  constructor(minCorte = 1.2, beta = 4, dCorte = 1) { this.minCorte = minCorte; this.beta = beta; this.dCorte = dCorte; this.x = null; this.dx = 0; this.t = 0; }
+  static a(corte, dt) { const r = 2 * Math.PI * corte * dt; return r / (r + 1); }
+  f(x, t) {
+    if (this.x == null) { this.x = x; this.t = t; return x; }
+    const dt = Math.max(1e-3, (t - this.t) / 1000); this.t = t;
+    const dx = (x - this.x) / dt; this.dx += Filtro1E.a(this.dCorte, dt) * (dx - this.dx);
+    this.x += Filtro1E.a(this.minCorte + this.beta * Math.abs(this.dx), dt) * (x - this.x);
+    return this.x;
+  }
+}
 const sub = (a, b) => [a[0] - b[0], a[1] - b[1]];
 const len = v => Math.hypot(v[0], v[1]);
 
@@ -78,11 +90,13 @@ export function crearCuerpo() {
   vid.append(video, ov);
   const bIni = el('button', 'pri big', 'Iniciar cámara');
   const r1 = el('div', 'row cap-main'); r1.append(bIni);
+  const bHueso = el('button', '', 'Óseo'), bMus = el('button', 'on', 'Músculo');
+  const r2 = el('div', 'row cap-sec'); r2.append(bHueso, bMus);
   const res = el('div', 'cu-res'); const resN = el('div', 'cu-n', '—'); res.append(resN);
   const det = el('div', 'cu-det'); det.hidden = true;
   const msg = el('div', 'cu-msg', 'Pulsa «Iniciar cámara» y apunta a una mano, un brazo o una pierna. Toca una parte para ver qué estructura es.');
   const cred = el('small', '', 'Reconocimiento: MediaPipe (en el teléfono, gratis). Atlas 3D: BodyParts3D © DBCLS, CC BY-SA 2.1 JP. La escala se ajusta sola a cada persona; aún sin medidas.');
-  box.append(vid, r1, res, msg, det, cred);
+  box.append(vid, r1, r2, res, msg, det, cred);
   page.appendChild(box);
 
   let atlas = null, pose = null, mano = null, stream = null, activo = false;
@@ -165,15 +179,48 @@ export function crearCuerpo() {
   }
 
   /* ---------- Reconocer el segmento y poner el atlas 3D ---------- */
-  // Suavizado de los puntos entre cuadros (para que no tiemble)
+  // Suavizado de los puntos entre cuadros (filtro One Euro por coordenada; se reinicia si cambia el tipo o hubo una pausa)
+  let filtros = null;
   function suavizar(tipo, mundo, img) {
-    const m = mundo.map(p => ({ x: p.x, y: p.y, z: p.z })), i = img.map(p => ({ x: p.x, y: p.y, z: p.z, visibility: p.visibility }));
-    if (suave && suave.tipo === tipo) {
-      const k = 0.5;
-      for (let j = 0; j < m.length; j++) for (const c of ['x', 'y', 'z']) { m[j][c] = k * m[j][c] + (1 - k) * suave.m[j][c]; i[j][c] = k * i[j][c] + (1 - k) * suave.i[j][c]; }
+    const t = performance.now();
+    if (!filtros || filtros.tipo !== tipo || t - filtros.t > 500 || filtros.n !== img.length) {
+      const nuevo = () => ({ x: new Filtro1E(), y: new Filtro1E(), z: new Filtro1E() });
+      filtros = { tipo, n: img.length, m: mundo.map(nuevo), i: img.map(nuevo) };
     }
-    suave = { tipo, m, i };
+    filtros.t = t;
+    const m = mundo.map((p, j) => ({ x: filtros.m[j].x.f(p.x, t), y: filtros.m[j].y.f(p.y, t), z: filtros.m[j].z.f(p.z, t) }));
+    const i = img.map((p, j) => ({ x: filtros.i[j].x.f(p.x, t), y: filtros.i[j].y.f(p.y, t), z: filtros.i[j].z.f(p.z, t), visibility: p.visibility }));
     return [m, i];
+  }
+  // Antebrazo junto con la mano: del codo (si MediaPipe Pose lo ve, en el mismo brazo) a la muñeca de la mano,
+  // con la pronación de la palma. Si no se ve el codo, sigue la línea de la mano (aproximado).
+  function antebrazoConMano(r, img, t) {
+    const C = r.C, W = video.videoWidth, H = video.videoHeight, D = Math.min(W, H);
+    const unp = (x, y, d) => THREE_V((x - atlas.W / 2) / atlas.f * d, -(y - atlas.H / 2) / atlas.f * d, -d);
+    let pa = null;
+    const rp = pose.detectForVideo(video, t);
+    const L = rp.landmarks && rp.landmarks[0], Mw = rp.worldLandmarks && rp.worldLandmarks[0];
+    if (L && Mw) {
+      const mw = [img[0].x * W, img[0].y * H];
+      let lado = -1, dmin = 0.15 * D;
+      for (const k of [0, 1]) { const i = LM.muneca[k], d = len(sub([L[i].x * W, L[i].y * H], mw)); if (d < dmin) { dmin = d; lado = k; } }
+      if (lado >= 0) {
+        const e = LM.codo[lado], w = LM.muneca[lado];
+        if (L[e].visibility > 0.5 && L[e].x > 0.01 && L[e].x < 0.99 && L[e].y > 0.01 && L[e].y < 0.99) {
+          const Dw = -C[0].z, De = Math.max(0.05, Dw + (Mw[e].z - Mw[w].z));
+          pa = unp(L[e].x * W, L[e].y * H, De);
+        }
+      }
+    }
+    const A = atlas.segs.antebrazo.art;
+    if (!pa) {
+      const nud = C[5].clone().add(C[9]).add(C[13]).add(C[17]).multiplyScalar(0.25);
+      const u = C[0].clone().sub(nud).normalize();
+      pa = C[0].clone().addScaledVector(u, A.codo.distanceTo(A.muneca) * r.escala);
+    }
+    const ref = C[5].clone().sub(C[0]).cross(C[17].clone().sub(C[0]));
+    const ra = E => E('mcp2').sub(E('muneca')).cross(E('mcp5').sub(E('muneca')));
+    return atlas.segmento('antebrazo', r.izq, pa, C[0], ref, ra, 'codo', 'muneca');
   }
   function reconocer() {
     const W = video.videoWidth, H = video.videoHeight, t = performance.now();
@@ -182,7 +229,10 @@ export function crearCuerpo() {
     if (rm.landmarks && rm.landmarks.length && rm.worldLandmarks && rm.worldLandmarks.length) {
       const [m, i] = suavizar('mano', rm.worldLandmarks[0], rm.landmarks[0]);
       const r = atlas.mano(m, i);
-      actual = r ? { zona: 'mano', lado: r.izq ? 1 : 0, piezas: ['mano'], vista: r.palma ? 'palma' : 'dorso' } : null;
+      if (!r) { actual = null; return; }
+      const piezas = ['mano'];
+      if (antebrazoConMano(r, i, t)) piezas.push('antebrazo');
+      actual = { zona: 'mano', lado: r.izq ? 1 : 0, piezas, vista: r.palma ? 'palma' : 'dorso' };
       return;
     }
     // 2) Con el cuerpo a la vista (MediaPipe Pose): lo que está al centro de la imagen, segmento o articulación
@@ -335,6 +385,13 @@ export function crearCuerpo() {
 
   /* ---------- Botones ---------- */
   bIni.onclick = () => (activo ? detener() : iniciar());
+  // Óseo: solo huesos. Músculo: músculos encima de los huesos.
+  const verCapa = c => {
+    capa = c; bHueso.classList.toggle('on', c === 'hueso'); bMus.classList.toggle('on', c === 'musculo');
+    if (atlas) { atlas.ponerCapa(c); atlas.pintar(); }
+  };
+  bHueso.onclick = () => verCapa('hueso');
+  bMus.onclick = () => verCapa('musculo');
 
   return { page, detener, get activo() { return activo; } };
 }

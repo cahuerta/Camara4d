@@ -3,7 +3,7 @@
 import { crearCuerpo, VERSION as CUERPO_VERSION } from './cuerpo.js';
 import { VERSION as ATLAS_VERSION } from './atlas3d.js';
 
-const APP_VERSION = '28';
+const APP_VERSION = '29';
 const $ = id => document.getElementById(id);
 const showErr = m => (window.showAppError ? window.showAppError(m) : console.error(m));
 
@@ -12,8 +12,8 @@ document.querySelectorAll('body > .box').forEach(e => e.remove());
 $('title').innerHTML = 'Cámara 4D <span>v' + APP_VERSION + '</span>';
 {
   const bad = [];
-  if (CUERPO_VERSION !== '8') bad.push('js/cuerpo.js');
-  if (ATLAS_VERSION !== '4') bad.push('js/atlas3d.js');
+  if (CUERPO_VERSION !== '9') bad.push('js/cuerpo.js');
+  if (ATLAS_VERSION !== '5') bad.push('js/atlas3d.js');
   if (bad.length) showErr('Archivos de otra versión: ' + bad.join(', ') + '. Recarga la página.');
 }
 const pantalla = crearCuerpo();

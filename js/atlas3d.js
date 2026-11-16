@@ -11,7 +11,7 @@
 
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.147.0/build/three.module.js';
 
-export const VERSION = '4';
+export const VERSION = '5';
 const BASE = 'img/atlas3d/';
 
 const v3 = a => new THREE.Vector3(a[0], a[1], a[2]);
@@ -31,6 +31,18 @@ function base(a, b, r) {
 function colocar(p, R, s, a, izq) {
   const m = new THREE.Matrix4().makeTranslation(p.x, p.y, p.z);
   m.multiply(R).multiply(new THREE.Matrix4().makeScale(s, s, s)).multiply(new THREE.Matrix4().makeTranslation(-a.x, -a.y, -a.z));
+  if (izq) m.multiply(ESPEJO);
+  return m;
+}
+// Como colocar(), pero estirando solo a lo largo del eje del hueso (e, en el atlas ya en espejo): el grosor queda con la escala s
+function colocarLargo(p, R, s, f, e, a, izq) {
+  const E = new THREE.Matrix4().set(
+    1 + (f - 1) * e.x * e.x, (f - 1) * e.x * e.y, (f - 1) * e.x * e.z, 0,
+    (f - 1) * e.y * e.x, 1 + (f - 1) * e.y * e.y, (f - 1) * e.y * e.z, 0,
+    (f - 1) * e.z * e.x, (f - 1) * e.z * e.y, 1 + (f - 1) * e.z * e.z, 0,
+    0, 0, 0, 1);
+  const m = new THREE.Matrix4().makeTranslation(p.x, p.y, p.z);
+  m.multiply(R).multiply(new THREE.Matrix4().makeScale(s, s, s)).multiply(E).multiply(new THREE.Matrix4().makeTranslation(-a.x, -a.y, -a.z));
   if (izq) m.multiply(ESPEJO);
   return m;
 }
@@ -127,31 +139,32 @@ export class Atlas3D {
     for (const m of s.piezas.palma || []) m.matrix.copy(Tp);
     // Cada metacarpiano: desde su base en el carpo hasta el nudillo de su dedo (así no queda luxado)
     const Rrot = new THREE.Matrix4().extractRotation(Rp), q0 = new THREE.Quaternion(), Rm = new THREE.Matrix4();
-    for (let n = 2; n <= 5; n++) {
-      const pz = s.piezas['mc' + n]; if (!pz) continue;
-      const k = 4 * (n - 1) + 1, Ba = espejo(A['mcb' + n], izq);
+    for (let n = 1; n <= 5; n++) {
+      // n = 1: metacarpiano del pulgar (base en el trapecio, cabeza en el nudillo del pulgar)
+      const pz = n === 1 ? s.piezas['h1-2'] : s.piezas['mc' + n]; if (!pz) continue;
+      const k = n === 1 ? 2 : 4 * (n - 1) + 1, Ba = n === 1 ? M(1) : espejo(A['mcb' + n], izq);
       const Bv = gV.clone().add(Ba.clone().sub(gA).applyMatrix4(Rrot).multiplyScalar(s0));   // base en la cámara (con la palma)
       const ejeA = M(k).sub(Ba).applyMatrix4(Rrot).normalize(), ejeV = C[k].clone().sub(Bv);
       const largo = ejeV.length(); ejeV.normalize();
       q0.setFromUnitVectors(ejeA, ejeV); Rm.makeRotationFromQuaternion(q0).multiply(Rp);
-      const sk = Math.min(1.6 * s0, Math.max(0.6 * s0, largo / M(k).distanceTo(Ba)));
-      const mt = colocar(Bv, Rm, sk, Ba, izq);
+      const f = Math.min(1.6, Math.max(0.6, largo / (s0 * M(k).distanceTo(Ba))));
+      const mt = colocarLargo(Bv, Rm, s0, f, M(k).sub(Ba).normalize(), Ba, izq);
       for (const m of pz) m.matrix.copy(mt);
     }
     // Cada falange (y el metacarpiano del pulgar) entre dos puntos de MediaPipe
     const q = new THREE.Quaternion(), Rq = new THREE.Matrix4();
     for (const pz in s.piezas) {
-      if (pz === 'palma' || pz.startsWith('mc')) continue;
+      if (pz === 'palma' || pz.startsWith('mc') || pz === 'h1-2') continue;
       const [i, j] = pz.slice(1).split('-').map(Number);
       const ejeA = M(j).sub(M(i)).applyMatrix4(new THREE.Matrix4().extractRotation(Rp)).normalize();
       const ejeV = C[j].clone().sub(C[i]).normalize();
       q.setFromUnitVectors(ejeA, ejeV); Rq.makeRotationFromQuaternion(q).multiply(Rp);
       // Cada falange con el largo que tiene en la imagen (llega justo a la articulación siguiente)
-      const sk = Math.min(2 * s0, Math.max(0.5 * s0, C[j].distanceTo(C[i]) / M(j).distanceTo(M(i))));
-      const mt = colocar(C[i], Rq, sk, M(i), izq);
+      const f = Math.min(2, Math.max(0.5, C[j].distanceTo(C[i]) / (s0 * M(j).distanceTo(M(i)))));
+      const mt = colocarLargo(C[i], Rq, s0, f, M(j).sub(M(i)).normalize(), M(i), izq);
       for (const m of s.piezas[pz]) m.matrix.copy(mt);
     }
-    return { izq, palma: this.palma(C, izq) };
+    return { izq, palma: this.palma(C, izq), C, escala: s0 };
   }
   // ¿Se ve la palma? La normal de la palma (hacia palmar) apunta a la cámara
   palma(C, izq) {
