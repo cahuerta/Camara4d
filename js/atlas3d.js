@@ -11,7 +11,7 @@
 
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.147.0/build/three.module.js';
 
-export const VERSION = '3';
+export const VERSION = '4';
 const BASE = 'img/atlas3d/';
 
 const v3 = a => new THREE.Vector3(a[0], a[1], a[2]);
@@ -114,16 +114,34 @@ export class Atlas3D {
     const quir = (p0, p5, p17, p2) => Math.sign(p5.clone().sub(p0).cross(p17.clone().sub(p0)).dot(p2.clone().sub(p0)));
     const izq = quir(C[0], C[5], C[17], C[2]) !== quir(h(0), h(5), h(17), h(2));
     const M = k => espejo(h(k), izq);
-    const s0 = C[9].distanceTo(C[0]) / h(9).distanceTo(h(0));
-    // Palma
-    const Fa = base(M(0), M(9), M(5).sub(M(17))), Fv = base(C[0], C[9], C[5].clone().sub(C[17]));
+    // Palma (carpo): ajustada a los cinco puntos de la mano a la vez (muñeca y los cuatro nudillos)
+    const K = [0, 5, 9, 13, 17];
+    const cen = arr => arr.reduce((a, p) => a.add(p), new THREE.Vector3()).multiplyScalar(1 / arr.length);
+    const nA = cen([5, 9, 13, 17].map(M)), nV = cen([5, 9, 13, 17].map(i => C[i]));
+    const Fa = base(M(0), nA, M(5).sub(M(17))), Fv = base(C[0], nV, C[5].clone().sub(C[17]));
     if (!Fa || !Fv) return null;
     const Rp = Fv.clone().multiply(Fa.clone().transpose());
-    for (const m of s.piezas.palma || []) m.matrix.copy(colocar(C[0], Rp, s0, M(0), izq));
+    const s0 = nV.distanceTo(C[0]) / nA.distanceTo(M(0));
+    const gA = cen(K.map(M)), gV = cen(K.map(i => C[i]));
+    const Tp = colocar(gV, Rp, s0, gA, izq);
+    for (const m of s.piezas.palma || []) m.matrix.copy(Tp);
+    // Cada metacarpiano: desde su base en el carpo hasta el nudillo de su dedo (así no queda luxado)
+    const Rrot = new THREE.Matrix4().extractRotation(Rp), q0 = new THREE.Quaternion(), Rm = new THREE.Matrix4();
+    for (let n = 2; n <= 5; n++) {
+      const pz = s.piezas['mc' + n]; if (!pz) continue;
+      const k = 4 * (n - 1) + 1, Ba = espejo(A['mcb' + n], izq);
+      const Bv = gV.clone().add(Ba.clone().sub(gA).applyMatrix4(Rrot).multiplyScalar(s0));   // base en la cámara (con la palma)
+      const ejeA = M(k).sub(Ba).applyMatrix4(Rrot).normalize(), ejeV = C[k].clone().sub(Bv);
+      const largo = ejeV.length(); ejeV.normalize();
+      q0.setFromUnitVectors(ejeA, ejeV); Rm.makeRotationFromQuaternion(q0).multiply(Rp);
+      const sk = Math.min(1.6 * s0, Math.max(0.6 * s0, largo / M(k).distanceTo(Ba)));
+      const mt = colocar(Bv, Rm, sk, Ba, izq);
+      for (const m of pz) m.matrix.copy(mt);
+    }
     // Cada falange (y el metacarpiano del pulgar) entre dos puntos de MediaPipe
     const q = new THREE.Quaternion(), Rq = new THREE.Matrix4();
     for (const pz in s.piezas) {
-      if (pz === 'palma') continue;
+      if (pz === 'palma' || pz.startsWith('mc')) continue;
       const [i, j] = pz.slice(1).split('-').map(Number);
       const ejeA = M(j).sub(M(i)).applyMatrix4(new THREE.Matrix4().extractRotation(Rp)).normalize();
       const ejeV = C[j].clone().sub(C[i]).normalize();

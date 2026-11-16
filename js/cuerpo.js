@@ -4,13 +4,12 @@
 //   Los dos son gratis (Apache 2.0), corren en el teléfono y no envían imágenes.
 // · Atlas 3D (atlas3d.js): BodyParts3D © DBCLS, CC BY-SA 2.1 JP. Sigue el movimiento y el giro;
 //   la escala sale del largo real de cada segmento de la persona.
-// · Nuestra red (red.js) corre al lado y aprende: «Correcto / Incorrecto» guarda fotos reales para reentrenarla.
+// · Primera fase: solo reconocimiento (sin botones extra). Nuestra red (red.js) queda en el repo para después.
 
-import { Red } from './red.js';
 import { Atlas3D, THREE } from './atlas3d.js';
 const THREE_V = (x, y, z) => new THREE.Vector3(x, y, z);
 
-export const VERSION = '7';
+export const VERSION = '8';
 
 const MP = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
 const MOD_POSE = 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task';
@@ -70,22 +69,6 @@ export function ajustarSilueta(mask, w, h, W, H, esPiel) {
   return { centro: [mx, my], u, ancho, anchoInicio: wa, anchoFin: wb };
 }
 
-/* ---------- Fotos reales para reentrenar nuestra red (se guardan en el teléfono) ---------- */
-const BD = { db: null };
-function abrirBD() {
-  if (BD.db) return Promise.resolve(BD.db);
-  return new Promise((ok, mal) => {
-    let r; try { r = indexedDB.open('camara4d_fotos', 1); } catch (e) { mal(e); return; }
-    r.onupgradeneeded = () => r.result.createObjectStore('fotos', { autoIncrement: true });
-    r.onsuccess = () => { BD.db = r.result; ok(BD.db); };
-    r.onerror = () => mal(r.error);
-  });
-}
-async function bd(modo, fn) {
-  const db = await abrirBD();
-  return new Promise((ok, mal) => { const t = db.transaction('fotos', modo); const q = fn(t.objectStore('fotos')); t.oncomplete = () => ok(q && q.result); t.onerror = () => mal(t.error); });
-}
-
 export function crearCuerpo() {
   const page = el('section', 'page');
   const box = el('div', 'box');
@@ -94,34 +77,18 @@ export function crearCuerpo() {
   const ov = el('canvas');
   vid.append(video, ov);
   const bIni = el('button', 'pri big', 'Iniciar cámara');
-  const bCapa = el('button', 'on', 'Capa: músculo');
-  const bPausa = el('button', '', '⏸ Pausar');
-  const bSeg = el('button', '', 'De cerca: automático');
   const r1 = el('div', 'row cap-main'); r1.append(bIni);
-  const r2 = el('div', 'row cap-sec'); r2.append(bCapa, bSeg, bPausa);
-  const res = el('div', 'cu-res'); const resN = el('div', 'cu-n', '—'), resO = el('div', 'cu-o', ''); res.append(resN, resO);
+  const res = el('div', 'cu-res'); const resN = el('div', 'cu-n', '—'); res.append(resN);
   const det = el('div', 'cu-det'); det.hidden = true;
-  // Enseñar a nuestra red
-  const ens = el('div', 'cu-ens');
-  const bOk = el('button', '', '✔ Correcto'), bMal = el('button', '', '✘ Incorrecto');
-  const sel = el('select'); sel.hidden = true;
-  const bGuardar = el('button', '', 'Guardar'); bGuardar.hidden = true;
-  const nFotos = el('span', 'cu-o', '');
-  const bBajar = el('button', '', '⬇ Descargar fotos');
-  const r3 = el('div', 'row'); r3.append(bOk, bMal, sel, bGuardar);
-  const r4 = el('div', 'row'); r4.append(nFotos, bBajar);
-  ens.append(el('div', 'cu-t', 'Enseñar a nuestra red'), r3, r4);
   const msg = el('div', 'cu-msg', 'Pulsa «Iniciar cámara» y apunta a una mano, un brazo o una pierna. Toca una parte para ver qué estructura es.');
   const cred = el('small', '', 'Reconocimiento: MediaPipe (en el teléfono, gratis). Atlas 3D: BodyParts3D © DBCLS, CC BY-SA 2.1 JP. La escala se ajusta sola a cada persona; aún sin medidas.');
-  box.append(vid, r1, r2, res, msg, det, ens, cred);
+  box.append(vid, r1, res, msg, det, cred);
   page.appendChild(box);
 
-  let atlas = null, pose = null, mano = null, stream = null, activo = false, pausa = false;
-  let capa = 'musculo', lastT = -1, actual = null, cuadro = 0, suave = null;
+  let atlas = null, pose = null, mano = null, stream = null, activo = false;
+  let capa = 'musculo', lastT = -1, actual = null, suave = null;
   let lejos = null;   // último resultado con el cuerpo a la vista (se mantiene un momento si MediaPipe lo pierde)
-  let segm = null, segmCargando = false, segmError = '', eleccion = null, ultima = null;   // ultima: lo último reconocido de lejos (se sigue usando al acercarse)   // de cerca: silueta de la piel; eleccion = segmento elegido a mano
-  const red = new Red(); let redOk = false, redProb = null;
-  const peq = document.createElement('canvas'); const pctx = peq.getContext('2d', { willReadFrequently: true });
+  let segm = null, segmCargando = false, segmError = '', ultima = null;   // de cerca: silueta de la piel; ultima: lo último reconocido de lejos (se sigue usando al acercarse)
 
   async function cargarAtlas() {
     if (atlas) return;
@@ -160,14 +127,14 @@ export function crearCuerpo() {
   async function iniciar() {
     bIni.disabled = true;
     try {
-      await Promise.all([cargarAtlas(), cargarModelos(), redOk ? null : red.cargar('img/red/').then(() => { redOk = true; peq.width = peq.height = red.N; }).catch(() => {})]);
+      await Promise.all([cargarAtlas(), cargarModelos()]);
       stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
       video.srcObject = stream;
       const p = video.play(); if (p && p.catch) p.catch(() => {});
       const t0 = performance.now();
       while (!video.videoWidth) { if (performance.now() - t0 > 8000) throw new Error('la cámara no entregó imagen'); await new Promise(r => setTimeout(r, 50)); }
       atlas.tamano(video.videoWidth, video.videoHeight);
-      activo = true; pausa = false; lastT = -1; actual = null;
+      activo = true; lastT = -1; actual = null;
       bIni.textContent = '⏹ Detener'; bIni.classList.add('stop'); bIni.disabled = false;
       msg.textContent = '';
       cargarSilueta();
@@ -187,18 +154,11 @@ export function crearCuerpo() {
 
   function bucle() {
     if (!activo) return;
-    if (!pausa && video.readyState >= 2 && video.currentTime !== lastT) {
+    if (video.readyState >= 2 && video.currentTime !== lastT) {
       lastT = video.currentTime;
       atlas.empezar();
       try { reconocer(); } catch (e) { msg.textContent = 'Error del reconocimiento: ' + e.message; }
       atlas.pintar();
-      // Nuestra red: uno de cada tres cuadros, sobre el cuadrado del centro
-      if (redOk && ++cuadro % 3 === 0) {
-        const W = video.videoWidth, H = video.videoHeight, L = Math.min(W, H);
-        pctx.drawImage(video, (W - L) / 2, (H - L) / 2, L, L, 0, 0, red.N, red.N);
-        const p = red.predecir(pctx.getImageData(0, 0, red.N, red.N));
-        redProb = redProb ? redProb.map((v, i) => 0.6 * v + 0.4 * p[i]) : Array.from(p);
-      }
       mostrarResultado();
     }
     requestAnimationFrame(bucle);
@@ -310,24 +270,12 @@ export function crearCuerpo() {
   }
 
   // De cerca (no se ve el cuerpo): silueta de la piel + zona elegida a mano o la que dice nuestra red
-  const RED_ZONA = { antebrazo: 'Antebrazo', brazo: 'Brazo', muslo: 'Muslo', pierna: 'Pierna', pie: 'Pie', codo: 'Codo', rodilla: 'Rodilla', tobillo: 'Tobillo' };
-  function zonaDeLaRed() {
-    if (!redProb) return null;
-    let mejor = null;
-    for (const z in RED_ZONA) for (const lado of [0, 1]) {
-      const i = red.nombres.findIndex(n => n.startsWith(RED_ZONA[z] + ' ') && (lado ? /izquierd/.test(n) : /derech/.test(n)));
-      if (i >= 0 && (!mejor || redProb[i] > mejor.p)) mejor = { zona: z, lado, p: redProb[i] };
-    }
-    return mejor && mejor.p > 0.5 ? mejor : null;
-  }
   function deCerca(t) {
-    // Qué es: lo elegido a mano; si no, lo último reconocido de lejos (al acercarse); si no, nuestra red
+    // Qué es: lo último reconocido de lejos (al acercarse)
     const DE_CERCA = { hombro: 'brazo', cadera: 'muslo' };
     let elegido = null;
-    if (eleccion) elegido = { zona: eleccion, lado: null };
-    else if (ultima && performance.now() - ultima.t < 120000) elegido = { zona: DE_CERCA[ultima.zona] || ultima.zona, lado: ultima.lado };
-    else elegido = zonaDeLaRed();
-    if (!elegido) { actual = { aviso: 'De cerca: aléjate un poco para que reconozca el segmento y luego acércate, o elige qué es con «De cerca».' }; return; }
+    if (ultima && performance.now() - ultima.t < 120000) elegido = { zona: DE_CERCA[ultima.zona] || ultima.zona, lado: ultima.lado };
+    if (!elegido) { actual = { aviso: 'De cerca: aléjate un poco para que reconozca el segmento y luego acércate.' }; return; }
     if (!segm && !window.__mascaraPrueba) {
       actual = { aviso: segmError ? 'No se pudo cargar el reconocimiento de cerca: ' + segmError : 'Cargando el reconocimiento de cerca…' };
       if (!segmError) cargarSilueta();
@@ -368,10 +316,6 @@ export function crearCuerpo() {
   function mostrarResultado() {
     if (actual && actual.aviso) resN.textContent = actual.aviso;
     else resN.textContent = actual ? nombreDe(actual.zona, actual.lado) + (actual.vista ? ' · ' + actual.vista : '') + (actual.deCerca ? ' · de cerca (vista de frente)' : '') : 'Buscando un segmento…';
-    if (redProb) {
-      const i = redProb.indexOf(Math.max(...redProb));
-      resO.textContent = 'Nuestra red (aprendiendo): ' + red.nombres[i] + ' ' + Math.round(redProb[i] * 100) + '%';
-    }
   }
 
   /* ---------- Tocar: qué estructura hay bajo el dedo ---------- */
@@ -389,61 +333,8 @@ export function crearCuerpo() {
     det.append(el('div', 'cu-l', 'Músculos: ' + (musculos.join(', ') || '—')));
   });
 
-  /* ---------- Enseñar a nuestra red ---------- */
-  async function contar() { try { nFotos.textContent = 'Fotos guardadas: ' + (await bd('readonly', s => s.count())); } catch (e) { nFotos.textContent = 'No se pueden guardar fotos en este navegador.'; } }
-  function foto() {
-    const c = document.createElement('canvas'); c.width = c.height = 128;
-    const W = video.videoWidth, H = video.videoHeight, L = Math.min(W, H);
-    c.getContext('2d').drawImage(video, (W - L) / 2, (H - L) / 2, L, L, 0, 0, 128, 128);
-    return c.toDataURL('image/jpeg', 0.9);
-  }
-  async function guardar(etiqueta) {
-    if (!activo) { msg.textContent = 'Primero inicia la cámara.'; return; }
-    try { await bd('readwrite', s => s.add({ etiqueta, foto: foto(), fecha: Date.now() })); msg.textContent = 'Foto guardada como «' + etiqueta + '».'; contar(); }
-    catch (e) { msg.textContent = 'No pude guardar la foto: ' + e.message; }
-  }
-  bOk.onclick = () => {
-    if (!actual || !actual.zona) { msg.textContent = 'No hay segmento reconocido: usa «Incorrecto» y elige cuál es.'; return; }
-    if (actual.lado == null) { msg.textContent = 'No sé el lado: usa «Incorrecto» y elige el segmento con su lado.'; return; }
-    guardar(nombreDe(actual.zona, actual.lado));
-  };
-  bMal.onclick = async () => {
-    if (!sel.options.length) {
-      if (!redOk) { try { await red.cargar('img/red/'); redOk = true; peq.width = peq.height = red.N; } catch (e) { /* nada */ } }
-      for (const n of red.nombres) { const o = el('option', '', n); o.value = n; sel.appendChild(o); }
-    }
-    sel.hidden = bGuardar.hidden = false;
-  };
-  bGuardar.onclick = () => { guardar(sel.value); sel.hidden = bGuardar.hidden = true; };
-  bBajar.onclick = async () => {
-    try {
-      const fotos = await bd('readonly', s => s.getAll());
-      if (!fotos || !fotos.length) { msg.textContent = 'Todavía no hay fotos guardadas.'; return; }
-      const a = el('a'); a.href = URL.createObjectURL(new Blob([JSON.stringify(fotos)], { type: 'application/json' }));
-      a.download = 'camara4d_fotos_' + new Date().toISOString().slice(0, 10) + '.json'; document.body.appendChild(a); a.click(); a.remove();
-      msg.textContent = 'Descargadas ' + fotos.length + ' fotos. Mándame ese archivo para reentrenar la red.';
-    } catch (e) { msg.textContent = 'No pude descargar: ' + e.message; }
-  };
-  contar();
-
   /* ---------- Botones ---------- */
   bIni.onclick = () => (activo ? detener() : iniciar());
-  bCapa.onclick = () => {
-    capa = capa === 'musculo' ? 'hueso' : 'musculo';
-    bCapa.textContent = 'Capa: ' + (capa === 'musculo' ? 'músculo' : 'hueso');
-    if (atlas) { atlas.ponerCapa(capa); if (actual) atlas.pintar(); }
-  };
-  const ORDEN_SEG = [null, 'brazo', 'codo', 'antebrazo', 'muslo', 'rodilla', 'pierna', 'tobillo', 'pie'];
-  bSeg.onclick = () => {
-    eleccion = ORDEN_SEG[(ORDEN_SEG.indexOf(eleccion) + 1) % ORDEN_SEG.length];
-    bSeg.textContent = 'De cerca: ' + (eleccion ? ZONA(eleccion).nombre.toLowerCase() : 'automático');
-    bSeg.classList.toggle('on', !!eleccion);
-  };
-  bPausa.onclick = () => {
-    pausa = !pausa; bPausa.textContent = pausa ? '▶ Seguir' : '⏸ Pausar';
-    if (pausa) { video.pause(); msg.textContent = 'En pausa: toca una parte para ver qué estructura es.'; }
-    else { msg.textContent = ''; const p = video.play(); if (p && p.catch) p.catch(() => {}); }
-  };
 
   return { page, detener, get activo() { return activo; } };
 }
