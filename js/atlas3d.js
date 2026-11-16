@@ -4,11 +4,14 @@
 // · Posición: puntos 3D de MediaPipe (en metros) + puntos en la imagen. La escala sale del largo real
 //   del segmento de cada persona (sin medir a mano).
 // · Mano: cada falange se mueve con su dedo. Antebrazo, brazo, muslo, pierna y pie: un bloque rígido
-//   con su giro (pronación, rotación de la pierna) sacado de la mano o del pie.
+//   con su giro (pronación, rotación de la pierna) sacado de la mano o del pie. Hombro y cadera: la pieza
+//   del tronco (escápula y clavícula; pelvis y glúteos) con el giro del tronco.
+// · Se pueden mostrar varias piezas a la vez (por ejemplo, en la rodilla: muslo y pierna, cada uno con su movimiento).
+//   Uso por cuadro: empezar() → piezas … → pintar().
 
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.147.0/build/three.module.js';
 
-export const VERSION = '2';
+export const VERSION = '3';
 const BASE = 'img/atlas3d/';
 
 const v3 = a => new THREE.Vector3(a[0], a[1], a[2]);
@@ -97,11 +100,13 @@ export class Atlas3D {
     return Wc.map((w, i) => { const D = Math.max(0.05, Z - (w.z - z0)); return new THREE.Vector3((px[i][0] - W / 2) / f * D, -(px[i][1] - H / 2) / f * D, -D); });
   }
 
-  ocultar() { for (const s of Object.values(this.segs)) s.grupo.visible = false; this.actual = null; this.r.clear(); }
+  empezar() { for (const s of Object.values(this.segs)) s.grupo.visible = false; this.visibles = []; }
+  mostrar(seg) { const s = this.segs[seg]; s.grupo.visible = true; this.capaDe(s); if (!this.visibles.includes(seg)) this.visibles.push(seg); return s; }
+  ocultar() { this.empezar(); this.r.clear(); }
 
   // Mano: 21 puntos de MediaPipe Hand
   mano(mundo, img) {
-    const s = this.segs.mano; this.solo(s);
+    const s = this.mostrar('mano');
     const C = this.aCamara(mundo, img, [0, 5, 9, 13, 17]);
     if (!C) return null;
     const A = s.art, h = k => A['h' + k];
@@ -128,8 +133,6 @@ export class Atlas3D {
       const mt = colocar(C[i], Rq, sk, M(i), izq);
       for (const m of s.piezas[pz]) m.matrix.copy(mt);
     }
-    this.actual = { seg: 'mano', izq };
-    this.pintar();
     return { izq, palma: this.palma(C, izq) };
   }
   // ¿Se ve la palma? La normal de la palma (hacia palmar) apunta a la cámara
@@ -143,7 +146,7 @@ export class Atlas3D {
   // Otros segmentos: pa, pb = extremos en la cámara; r = referencia de giro en la cámara;
   // refAtlas(E) = la misma referencia en el atlas, calculada con E(nombre) (ya en espejo si es el lado izquierdo)
   segmento(seg, izq, pa, pb, r, refAtlas, aName, bName) {
-    const s = this.segs[seg]; this.solo(s);
+    const s = this.mostrar(seg);
     const E = n => espejo(s.art[n], izq);
     const A = E(aName), B = E(bName);
     const Fa = base(A, B, refAtlas(E)), Fv = base(pa, pb, r);
@@ -152,34 +155,51 @@ export class Atlas3D {
     const k = pa.distanceTo(pb) / A.distanceTo(B);
     const mt = colocar(pa, R, k, A, izq);
     for (const m of s.mallas) m.matrix.copy(mt);
-    this.actual = { seg, izq };
-    this.pintar();
+    return true;
+  }
+  // Pieza del tronco (hombro o cadera): ancla = la articulación en la cámara; arriba y adelante = ejes del tronco;
+  // anchoV = distancia entre los dos hombros (o caderas) en la cámara
+  tronco(seg, izq, ancla, arriba, adelante, anchoV, anclaNombre) {
+    const s = this.mostrar(seg);
+    const A = espejo(s.art[anclaNombre], izq);
+    const Fa = base(A, A.clone().add(new THREE.Vector3(0, 1, 0)), new THREE.Vector3(0, 0, 1));
+    const Fv = base(ancla, ancla.clone().add(arriba), adelante);
+    if (!Fa || !Fv) return false;
+    const k = anchoV / (2 * Math.abs(s.art[anclaNombre].x));
+    const mt = colocar(ancla, Fv.multiply(Fa.transpose()), k, A, izq);
+    for (const m of s.mallas) m.matrix.copy(mt);
     return true;
   }
   // Ancho del segmento visto de frente (lado a lado), en el atlas: para ajustar la escala a la silueta
-  anchoDe(seg, aName, bName) {
-    const s = this.segs[seg];
-    if (s.ancho) return s.ancho;
-    const A = s.art[aName], B = s.art[bName], F = base(A, B, new THREE.Vector3(0, 0, 1));
+  anchoDe(segs, aName, bName, t0 = 0.2, t1 = 0.8) {
+    const clave = segs.join('+') + aName + bName + t0 + t1;
+    this.anchos = this.anchos || {};
+    if (this.anchos[clave]) return this.anchos[clave];
+    const s0 = this.segs[segs[0]];
+    const A = s0.art[aName], B = s0.art[bName], F = base(A, B, new THREE.Vector3(0, 0, 1));
     const u = new THREE.Vector3(), v = new THREE.Vector3(), w = new THREE.Vector3(); F.extractBasis(u, v, w);
     const L = A.distanceTo(B), xs = [], p = new THREE.Vector3();
-    s.mallas.forEach((m, i) => {
-      if (s.info.partes[i].tipo !== 'musculo') return;
-      const pos = m.geometry.attributes.position;
-      for (let k = 0; k < pos.count; k += 3) {
-        p.fromBufferAttribute(pos, k).sub(A);
-        const t = p.dot(u) / L; if (t < 0.2 || t > 0.8) continue;
-        xs.push(p.dot(w));
-      }
-    });
+    for (const sg of segs) {
+      const s = this.segs[sg];
+      s.mallas.forEach((m, i) => {
+        if (s.info.partes[i].tipo !== 'musculo') return;
+        const pos = m.geometry.attributes.position;
+        for (let k = 0; k < pos.count; k += 3) {
+          p.fromBufferAttribute(pos, k).sub(A);
+          const t = p.dot(u) / L; if (t < t0 || t > t1) continue;
+          xs.push(p.dot(w));
+        }
+      });
+    }
     xs.sort((a, b) => a - b);
-    s.ancho = xs.length ? xs[Math.floor(xs.length * 0.95)] - xs[Math.floor(xs.length * 0.05)] : L * 0.3;
-    return s.ancho;
+    return (this.anchos[clave] = xs.length ? xs[Math.floor(xs.length * 0.95)] - xs[Math.floor(xs.length * 0.05)] : L * 0.3);
   }
-  // De cerca, sin puntos del cuerpo: el segmento se pone sobre la silueta de la piel (centro, dirección y ancho en píxeles).
-  // Se supone visto de frente; la escala sale del ancho de la silueta.
-  silueta(seg, izq, centro, dir, anchoPx, aName, bName) {
-    const s = this.segs[seg]; this.solo(s);
+  // De cerca, sin puntos del cuerpo: el segmento (o los dos de una articulación, estirados) se pone sobre la
+  // silueta de la piel (centro, dirección y ancho en píxeles). Se supone visto de frente; la escala sale del ancho.
+  // centroNombre: articulación del atlas que va al centro (si no, el punto medio de a–b); t0, t1: tramo donde medir el ancho
+  silueta(segs, izq, centro, dir, anchoPx, aName, bName, centroNombre, t0, t1) {
+    segs.forEach(sg => this.mostrar(sg));
+    const s = this.segs[segs[0]];
     const Z = 0.6, f = this.f;
     const E = n => espejo(s.art[n], izq);
     const A = E(aName), B = E(bName);
@@ -188,32 +208,30 @@ export class Atlas3D {
     const Fv = base(new THREE.Vector3(), u, new THREE.Vector3(0, 0, 1));
     if (!Fa || !Fv) return false;
     const R = Fv.multiply(Fa.transpose());
-    const k = (anchoPx * Z / f) / this.anchoDe(seg, aName, bName);
+    const k = (anchoPx * Z / f) / this.anchoDe(segs, aName, bName, t0, t1);
     const pc = new THREE.Vector3((centro[0] - this.W / 2) / f * Z, -(centro[1] - this.H / 2) / f * Z, -Z);
-    const mt = colocar(pc, R, k, A.clone().add(B).multiplyScalar(0.5), izq);
-    for (const m of s.mallas) m.matrix.copy(mt);
-    this.actual = { seg, izq };
-    this.pintar();
+    const mt = colocar(pc, R, k, centroNombre ? E(centroNombre) : A.clone().add(B).multiplyScalar(0.5), izq);
+    for (const sg of segs) for (const m of this.segs[sg].mallas) m.matrix.copy(mt);
     return true;
   }
-  solo(s) { for (const o of Object.values(this.segs)) o.grupo.visible = o === s; this.capaDe(s); }
-  pintar() { this.r.render(this.escena, this.cam); }
+  pintar() { if (this.visibles && this.visibles.length) this.r.render(this.escena, this.cam); else this.r.clear(); }
 
   // Qué estructura hay bajo un punto de la imagen (x, y en píxeles del video)
   tocar(x, y) {
-    if (!this.actual) return null;
-    const s = this.segs[this.actual.seg];
-    s.mallas.forEach(m => m.updateMatrixWorld(true));
+    if (!this.visibles || !this.visibles.length) return null;
+    const mallas = [];
+    for (const sg of this.visibles) for (const m of this.segs[sg].mallas) if (m.visible) { m.updateMatrixWorld(true); mallas.push(m); }
     this.ray.setFromCamera(new THREE.Vector2(x / this.W * 2 - 1, -(y / this.H) * 2 + 1), this.cam);
-    const hit = this.ray.intersectObjects(s.mallas.filter(m => m.visible), false)[0];
+    const hit = this.ray.intersectObjects(mallas, false)[0];
     if (!hit) return null;
-    const p = s.info.partes[hit.object.userData.parte];
-    return { nombre: p.nombre, hueso: p.tipo === 'hueso' };
+    const sg = this.visibles.find(k => this.segs[k].mallas.includes(hit.object));
+    const p = this.segs[sg].info.partes[hit.object.userData.parte];
+    return { nombre: p.nombre, hueso: p.tipo === 'hueso', seg: sg };
   }
-  partesDe(seg) {
-    const s = this.segs[seg]; if (!s) return { huesos: [], musculos: [] };
+  // Huesos y músculos de las piezas que se muestran
+  partesDe(segs) {
     const h = new Set(), m = new Set();
-    for (const p of s.info.partes) (p.tipo === 'hueso' ? h : m).add(p.nombre);
+    for (const sg of segs) { const s = this.segs[sg]; if (s) for (const p of s.info.partes) (p.tipo === 'hueso' ? h : m).add(p.nombre); }
     return { huesos: [...h], musculos: [...m] };
   }
 }

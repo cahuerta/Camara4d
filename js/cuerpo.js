@@ -10,7 +10,7 @@ import { Red } from './red.js';
 import { Atlas3D, THREE } from './atlas3d.js';
 const THREE_V = (x, y, z) => new THREE.Vector3(x, y, z);
 
-export const VERSION = '5';
+export const VERSION = '6';
 
 const MP = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
 const MOD_POSE = 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task';
@@ -28,6 +28,15 @@ const SEG = {
   pierna: { nombre: 'Pierna', fem: true, a: 'rodilla', b: 'tobillo', art: ['rodilla', 'tobillo'] },
   pie: { nombre: 'Pie', a: 'tobillo', b: 'dedo', art: ['tobillo', 'dedo_pie'] },
 };
+// Articulaciones: se dibujan las dos piezas que se juntan ahí, cada una con su movimiento
+const ART = {
+  hombro: { nombre: 'Hombro', piezas: ['hombro', 'brazo'] },
+  codo: { nombre: 'Codo', piezas: ['brazo', 'antebrazo'] },
+  cadera: { nombre: 'Cadera', fem: true, piezas: ['cadera', 'muslo'] },
+  rodilla: { nombre: 'Rodilla', fem: true, piezas: ['muslo', 'pierna'] },
+  tobillo: { nombre: 'Tobillo', piezas: ['pierna', 'pie'] },
+};
+const ZONA = k => SEG[k] || ART[k];
 const ARTIC = { hombro: 'hombro', codo: 'codo', muneca: 'muñeca', nudillos: 'nudillos (metacarpofalángicas)',
   cadera: 'cadera', rodilla: 'rodilla', tobillo: 'tobillo', dedo_pie: 'dedos del pie' };
 
@@ -116,7 +125,7 @@ export function crearCuerpo() {
   async function cargarAtlas() {
     if (atlas) return;
     const a = new Atlas3D(ov);
-    await Promise.all(Object.keys(SEG).map(s => a.cargar(s)));
+    await Promise.all(Object.keys(SEG).concat(['hombro', 'cadera']).map(s => a.cargar(s)));
     a.ponerCapa(capa);
     atlas = a;
   }
@@ -179,7 +188,9 @@ export function crearCuerpo() {
     if (!activo) return;
     if (!pausa && video.readyState >= 2 && video.currentTime !== lastT) {
       lastT = video.currentTime;
+      atlas.empezar();
       try { reconocer(); } catch (e) { msg.textContent = 'Error del reconocimiento: ' + e.message; }
+      atlas.pintar();
       // Nuestra red: uno de cada tres cuadros, sobre el cuadrado del centro
       if (redOk && ++cuadro % 3 === 0) {
         const W = video.videoWidth, H = video.videoHeight, L = Math.min(W, H);
@@ -210,66 +221,97 @@ export function crearCuerpo() {
     if (rm.landmarks && rm.landmarks.length && rm.worldLandmarks && rm.worldLandmarks.length) {
       const [m, i] = suavizar('mano', rm.worldLandmarks[0], rm.landmarks[0]);
       const r = atlas.mano(m, i);
-      actual = r ? { seg: 'mano', lado: r.izq ? 1 : 0, vista: r.palma ? 'palma' : 'dorso' } : null;
-      if (!r) atlas.ocultar();
+      actual = r ? { zona: 'mano', lado: r.izq ? 1 : 0, piezas: ['mano'], vista: r.palma ? 'palma' : 'dorso' } : null;
       return;
     }
-    // 2) Otros segmentos: el más grande que se vea entero (sus dos extremos dentro de la imagen)
+    // 2) Con el cuerpo a la vista (MediaPipe Pose): lo que está al centro de la imagen, segmento o articulación
     const rp = pose.detectForVideo(video, t);
     if (!(rp.landmarks && rp.landmarks[0] && rp.worldLandmarks && rp.worldLandmarks[0])) { suave = null; deCerca(t); return; }
     const [m, L] = suavizar('pose', rp.worldLandmarks[0], rp.landmarks[0]);
-    const ve = i => (L[i].visibility == null || L[i].visibility > 0.65) && L[i].x > 0.01 && L[i].x < 0.99 && L[i].y > 0.01 && L[i].y < 0.99;
-    let mejor = null;
-    for (const seg of ['antebrazo', 'brazo', 'muslo', 'pierna', 'pie']) for (const lado of [0, 1]) {
-      const ia = LM[SEG[seg].a][lado], ib = LM[SEG[seg].b][lado];
-      if (!(ve(ia) && ve(ib))) continue;
-      const l = len([(L[ib].x - L[ia].x) * W, (L[ib].y - L[ia].y) * H]);
-      if (l < 0.12 * Math.min(W, H)) continue;   // muy chico: no es el segmento que se está mirando
-      if (!mejor || l > mejor.l) mejor = { seg, lado, l, ia, ib };
+    const dentro = i => L[i].x > 0.01 && L[i].x < 0.99 && L[i].y > 0.01 && L[i].y < 0.99;
+    const ve = i => (L[i].visibility == null || L[i].visibility > 0.6) && dentro(i);
+    const px = i => [L[i].x * W, L[i].y * H], c = [W / 2, H / 2], D = Math.min(W, H);
+    const dSeg = (p, a, b) => { const ab = sub(b, a), t2 = Math.max(0, Math.min(1, ((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1]) / (ab[0] * ab[0] + ab[1] * ab[1] || 1))); return len(sub(p, [a[0] + t2 * ab[0], a[1] + t2 * ab[1]])); };
+    // Piezas que se pueden dibujar (sus dos extremos a la vista)
+    const puede = (pz, lado) => {
+      if (pz === 'hombro') return [11, 12].every(i => L[i].visibility > 0.5) && ve(LM.hombro[lado]);
+      if (pz === 'cadera') return [23, 24].every(i => L[i].visibility > 0.5) && ve(LM.cadera[lado]);
+      const S = SEG[pz]; return ve(LM[S.a][lado]) && ve(LM[S.b][lado]) && len(sub(px(LM[S.b][lado]), px(LM[S.a][lado]))) > 0.08 * D;
+    };
+    let foco = null;
+    // Articulación cerca del centro
+    for (const k in ART) for (const lado of [0, 1]) {
+      const i = LM[k][lado]; if (!ve(i)) continue;
+      const d = len(sub(px(i), c)); if (d > 0.15 * D) continue;
+      const piezas = ART[k].piezas.filter(pz => puede(pz, lado));
+      if (piezas.length && (!foco || d < foco.d)) foco = { zona: k, lado, d, piezas };
     }
-    if (!mejor) { deCerca(t); return; }
-    const C = atlas.aCamara(m, L, [mejor.ia, mejor.ib]);
-    if (!C) { actual = null; atlas.ocultar(); return; }
-    const { seg, lado } = mejor, P = k => C[LM[k][lado]], S = SEG[seg];
-    // Referencia de giro de cada segmento (en la cámara) y la misma en el atlas
+    // Si no, el segmento más cercano al centro
+    if (!foco) for (const seg of ['antebrazo', 'brazo', 'muslo', 'pierna', 'pie']) for (const lado of [0, 1]) {
+      if (!puede(seg, lado)) continue;
+      const d = dSeg(c, px(LM[SEG[seg].a][lado]), px(LM[SEG[seg].b][lado]));
+      if (!foco || d < foco.d) foco = { zona: seg, lado, d, piezas: [seg] };
+    }
+    if (!foco) { deCerca(t); return; }
+    // Profundidad con los extremos de las piezas que se dibujan
+    const ancla = new Set();
+    for (const pz of foco.piezas) {
+      if (pz === 'hombro') [11, 12].forEach(i => ancla.add(i));
+      else if (pz === 'cadera') [23, 24].forEach(i => ancla.add(i));
+      else { ancla.add(LM[SEG[pz].a][foco.lado]); ancla.add(LM[SEG[pz].b][foco.lado]); }
+    }
+    const C = atlas.aCamara(m, L, [...ancla]);
+    if (!C) { actual = null; return; }
+    const hechas = foco.piezas.filter(pz => colocarPieza(pz, foco.lado, C, L));
+    actual = hechas.length ? { zona: foco.zona, lado: foco.lado, piezas: hechas } : null;
+  }
+
+  // Pone una pieza con su giro. C: puntos en la cámara; L: puntos en la imagen (para saber qué se ve)
+  function colocarPieza(pz, lado, C, L) {
+    const P = k => C[LM[k][lado]];
+    const ejeTronco = () => {
+      const caderasOk = L[23].visibility > 0.3 && L[24].visibility > 0.3, hombrosOk = L[11].visibility > 0.3 && L[12].visibility > 0.3;
+      return caderasOk && hombrosOk ? C[11].clone().add(C[12]).sub(C[23]).sub(C[24]) : THREE_V(0, 1, 0);
+    };
+    if (pz === 'hombro' || pz === 'cadera') {
+      const [i, d] = pz === 'hombro' ? [11, 12] : [23, 24];
+      const arriba = ejeTronco(), der = C[d].clone().sub(C[i]);
+      return atlas.tronco(pz, !!lado, P(pz), arriba, arriba.clone().cross(der), C[d].distanceTo(C[i]), pz);
+    }
+    const S = SEG[pz];
     let r, ra;
-    if (seg === 'antebrazo') {            // pronación: la palma
+    if (pz === 'antebrazo') {            // pronación: la palma
       r = P('indice').clone().sub(P('muneca')).cross(P('menique').clone().sub(P('muneca')));
       ra = E => E('mcp2').sub(E('muneca')).cross(E('mcp5').sub(E('muneca')));
-    } else if (seg === 'brazo') {         // con el codo doblado: el antebrazo; estirado: hacia adelante del tronco
+    } else if (pz === 'brazo') {         // con el codo doblado: el antebrazo; estirado: hacia adelante del tronco
       const ab = P('codo').clone().sub(P('hombro')).normalize(), fa = P('muneca').clone().sub(P('codo')).normalize();
-      if (ab.angleTo(fa) > 0.45) r = fa;
-      else {
-        const arriba = C[11].clone().add(C[12]).sub(C[23]).sub(C[24]), der = C[12].clone().sub(C[11]);
-        r = arriba.cross(der);
-      }
+      r = ab.angleTo(fa) > 0.45 ? fa : ejeTronco().cross(C[12].clone().sub(C[11]));
       ra = () => THREE_V(0, 0, 1);
-    } else if (seg === 'muslo' || seg === 'pierna') {   // rotación: hacia dónde apunta el pie
+    } else if (pz === 'muslo' || pz === 'pierna') {   // rotación: hacia dónde apunta el pie
       r = P('dedo').clone().sub(P('talon'));
       ra = E => E('dedo_pie').sub(E('talon'));
     } else {                               // pie: el eje de la pierna
       r = P('rodilla').clone().sub(P('tobillo'));
       ra = E => E('rodilla').sub(E('tobillo'));
     }
-    const ok = atlas.segmento(seg, !!lado, P(S.a), P(S.b), r, ra, S.art[0], S.art[1]);
-    actual = ok ? { seg, lado } : null;
-    if (!ok) atlas.ocultar();
+    return atlas.segmento(pz, !!lado, P(S.a), P(S.b), r, ra, S.art[0], S.art[1]);
   }
 
-  // De cerca (no se ve el cuerpo): silueta de la piel + segmento elegido a mano o el que dice nuestra red
-  const SEG_RED = { antebrazo: 'Antebrazo', brazo: 'Brazo', muslo: 'Muslo', pierna: 'Pierna', pie: 'Pie' };
-  function segmentoDeLaRed() {
+  // De cerca (no se ve el cuerpo): silueta de la piel + zona elegida a mano o la que dice nuestra red
+  const RED_ZONA = { antebrazo: 'Antebrazo', brazo: 'Brazo', muslo: 'Muslo', pierna: 'Pierna', pie: 'Pie', codo: 'Codo', rodilla: 'Rodilla', tobillo: 'Tobillo' };
+  function zonaDeLaRed() {
     if (!redProb) return null;
     let mejor = null;
-    for (const seg in SEG_RED) for (const lado of [0, 1]) {
-      const i = red.nombres.findIndex(n => n.startsWith(SEG_RED[seg] + ' ') && (lado ? /izquierd/.test(n) : /derech/.test(n)));
-      if (i >= 0 && (!mejor || redProb[i] > mejor.p)) mejor = { seg, lado, p: redProb[i] };
+    for (const z in RED_ZONA) for (const lado of [0, 1]) {
+      const i = red.nombres.findIndex(n => n.startsWith(RED_ZONA[z] + ' ') && (lado ? /izquierd/.test(n) : /derech/.test(n)));
+      if (i >= 0 && (!mejor || redProb[i] > mejor.p)) mejor = { zona: z, lado, p: redProb[i] };
     }
     return mejor && mejor.p > 0.5 ? mejor : null;
   }
   function deCerca(t) {
-    const elegido = eleccion ? { seg: eleccion, lado: null } : segmentoDeLaRed();
-    if ((!segm && !window.__mascaraPrueba) || !elegido) { actual = null; atlas.ocultar(); if (!elegido) actual = { sinSegmento: true }; return; }
+    const elegido = eleccion ? { zona: eleccion, lado: null } : zonaDeLaRed();
+    if (!elegido) { actual = { sinZona: true }; return; }
+    if (!segm && !window.__mascaraPrueba) { actual = null; return; }
     let fit = null;
     const W = video.videoWidth, H = video.videoHeight;
     const prueba = window.__mascaraPrueba;   // solo para pruebas automáticas
@@ -281,21 +323,30 @@ export function crearCuerpo() {
     };
     if (prueba) { const m = prueba(); usar(m.arr, m.w, m.h); }
     else segm.segmentForVideo(video, t, r => { const m = r.categoryMask; if (m) usar(m.getAsUint8Array(), m.width, m.height); });
-    if (!fit) { actual = null; atlas.ocultar(); return; }
-    const S = SEG[elegido.seg];
+    if (!fit) { actual = null; return; }
     // El extremo más ancho es el proximal (en el pie, el más angosto: el tobillo)
     let u = fit.u, cerca = fit.anchoInicio >= fit.anchoFin;
-    if (elegido.seg === 'pie') cerca = !cerca;
+    if (elegido.zona === 'pie') cerca = !cerca;
     if (!cerca) u = [-u[0], -u[1]];
-    const ok = atlas.silueta(elegido.seg, elegido.lado === 1, fit.centro, u, fit.ancho, S.art[0], S.art[1]);
-    actual = ok ? { seg: elegido.seg, lado: elegido.lado, deCerca: true } : null;
-    if (!ok) atlas.ocultar();
+    const izq = elegido.lado === 1;
+    let ok, piezas;
+    if (SEG[elegido.zona]) {
+      const S = SEG[elegido.zona]; piezas = [elegido.zona];
+      ok = atlas.silueta(piezas, izq, fit.centro, u, fit.ancho, S.art[0], S.art[1]);
+    } else {
+      // Articulación de cerca: sus dos piezas, estiradas, con la articulación al centro de la silueta
+      piezas = ART[elegido.zona].piezas;
+      const a = SEG[piezas[0]].art[0], b = SEG[piezas[1]].art[1], j = elegido.zona;
+      const A = atlas.segs[piezas[0]].art, tj = A[a].distanceTo(A[j]) / A[a].distanceTo(A[b]);
+      ok = atlas.silueta(piezas, izq, fit.centro, u, fit.ancho, a, b, j, tj - 0.1, tj + 0.1);
+    }
+    actual = ok ? { zona: elegido.zona, lado: elegido.lado, piezas, deCerca: true } : null;
   }
 
-  const nombreDe = (seg, lado) => SEG[seg].nombre + (lado == null ? '' : ' ' + (lado ? (SEG[seg].fem ? 'izquierda' : 'izquierdo') : (SEG[seg].fem ? 'derecha' : 'derecho')));
+  const nombreDe = (zona, lado) => { const Z = ZONA(zona); return Z.nombre + (lado == null ? '' : ' ' + (lado ? (Z.fem ? 'izquierda' : 'izquierdo') : (Z.fem ? 'derecha' : 'derecho'))); };
   function mostrarResultado() {
-    if (actual && actual.sinSegmento) resN.textContent = 'De cerca: elige el segmento con el botón «De cerca»';
-    else resN.textContent = actual ? nombreDe(actual.seg, actual.lado) + (actual.vista ? ' · ' + actual.vista : '') + (actual.deCerca ? ' · de cerca (vista de frente)' : '') : 'Buscando un segmento…';
+    if (actual && actual.sinZona) resN.textContent = 'De cerca: elige qué es con el botón «De cerca»';
+    else resN.textContent = actual ? nombreDe(actual.zona, actual.lado) + (actual.vista ? ' · ' + actual.vista : '') + (actual.deCerca ? ' · de cerca (vista de frente)' : '') : 'Buscando un segmento…';
     if (redProb) {
       const i = redProb.indexOf(Math.max(...redProb));
       resO.textContent = 'Nuestra red (aprendiendo): ' + red.nombres[i] + ' ' + Math.round(redProb[i] * 100) + '%';
@@ -304,15 +355,15 @@ export function crearCuerpo() {
 
   /* ---------- Tocar: qué estructura hay bajo el dedo ---------- */
   ov.addEventListener('pointerdown', e => {
-    if (!atlas || !actual || !actual.seg) return;
+    if (!atlas || !actual || !actual.piezas) return;
     const r = ov.getBoundingClientRect();
     const x = (e.clientX - r.left) / r.width * atlas.W, y = (e.clientY - r.top) / r.height * atlas.H;
     const parte = atlas.tocar(x, y);
-    const { huesos, musculos } = atlas.partesDe(actual.seg);
+    const { huesos, musculos } = atlas.partesDe(actual.piezas);
     det.hidden = false; det.innerHTML = '';
-    det.append(el('div', 'cu-t', nombreDe(actual.seg, actual.lado)));
+    det.append(el('div', 'cu-t', nombreDe(actual.zona, actual.lado)));
     det.append(el('div', 'cu-p', parte ? 'Tocaste: ' + parte.nombre + (parte.hueso ? ' (hueso)' : ' (músculo)') : 'Toca sobre el dibujo para ver la estructura.'));
-    det.append(el('div', 'cu-l', 'Articulaciones: ' + SEG[actual.seg].art.map(a => ARTIC[a]).join(' → ')));
+    if (SEG[actual.zona]) det.append(el('div', 'cu-l', 'Articulaciones: ' + SEG[actual.zona].art.map(a => ARTIC[a]).join(' → ')));
     det.append(el('div', 'cu-l', 'Huesos: ' + (huesos.join(', ') || '—')));
     det.append(el('div', 'cu-l', 'Músculos: ' + (musculos.join(', ') || '—')));
   });
@@ -331,8 +382,9 @@ export function crearCuerpo() {
     catch (e) { msg.textContent = 'No pude guardar la foto: ' + e.message; }
   }
   bOk.onclick = () => {
-    if (!actual) { msg.textContent = 'No hay segmento reconocido: usa «Incorrecto» y elige cuál es.'; return; }
-    guardar(nombreDe(actual.seg, actual.lado));
+    if (!actual || !actual.zona) { msg.textContent = 'No hay segmento reconocido: usa «Incorrecto» y elige cuál es.'; return; }
+    if (actual.lado == null) { msg.textContent = 'No sé el lado: usa «Incorrecto» y elige el segmento con su lado.'; return; }
+    guardar(nombreDe(actual.zona, actual.lado));
   };
   bMal.onclick = async () => {
     if (!sel.options.length) {
@@ -360,10 +412,10 @@ export function crearCuerpo() {
     bCapa.textContent = 'Capa: ' + (capa === 'musculo' ? 'músculo' : 'hueso');
     if (atlas) { atlas.ponerCapa(capa); if (actual) atlas.pintar(); }
   };
-  const ORDEN_SEG = [null, 'antebrazo', 'brazo', 'muslo', 'pierna', 'pie'];
+  const ORDEN_SEG = [null, 'brazo', 'codo', 'antebrazo', 'muslo', 'rodilla', 'pierna', 'tobillo', 'pie'];
   bSeg.onclick = () => {
     eleccion = ORDEN_SEG[(ORDEN_SEG.indexOf(eleccion) + 1) % ORDEN_SEG.length];
-    bSeg.textContent = 'De cerca: ' + (eleccion ? SEG[eleccion].nombre.toLowerCase() : 'automático');
+    bSeg.textContent = 'De cerca: ' + (eleccion ? ZONA(eleccion).nombre.toLowerCase() : 'automático');
     bSeg.classList.toggle('on', !!eleccion);
   };
   bPausa.onclick = () => {
